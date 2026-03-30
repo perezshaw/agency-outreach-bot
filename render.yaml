@@ -2,10 +2,9 @@ services:
   - type: web
     name: agency-outreach-bot
     runtime: python
+    plan: free
     startCommand: python app.py
     envVars:
-      - key: PORT
-        value: 5000
       - key: SMTP_HOST
         value: smtp.gmail.com
       - key: SMTP_PORT
