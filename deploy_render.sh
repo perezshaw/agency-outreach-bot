@@ -135,41 +135,74 @@ fi
 
 if [ -n "$RENDER_API_KEY" ]; then
     # ─── Automatic Render Deployment via API ──────────────────────────────
-    echo -e "${YELLOW}→ Creating Render web service...${NC}"
 
-    # Get SMTP password
-    echo -e "${YELLOW}→ Email setup for outreach automation${NC}"
-    echo -e "  Your bot sends emails from: ${CYAN}hello@rezthegiant.com${NC}"
-    echo -e "  You need a Google App Password."
-    echo -e "  (Get one at: ${CYAN}https://myaccount.google.com/apppasswords${NC})"
-    echo ""
-    read -sp "Enter your Google App Password (16 chars, no spaces): " APP_PASSWORD
-    echo ""
-
-    # Create the service via Render API
-    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.render.com/v1/services" \
+    # First, get the owner ID (required by Render API)
+    echo -e "${YELLOW}→ Fetching your Render account info...${NC}"
+    OWNER_RESPONSE=$(curl -s -X GET "https://api.render.com/v1/owners" \
         -H "Authorization: Bearer $RENDER_API_KEY" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"type\": \"web_service\",
-            \"name\": \"agency-outreach-bot\",
-            \"repo\": \"$REPO_URL\",
-            \"autoDeploy\": \"yes\",
-            \"branch\": \"$(git branch --show-current)\",
-            \"runtime\": \"python\",
-            \"plan\": \"free\",
-            \"startCommand\": \"python app.py\",
-            \"envVars\": [
-                {\"key\": \"PORT\", \"value\": \"10000\"},
-                {\"key\": \"SMTP_HOST\", \"value\": \"smtp.gmail.com\"},
-                {\"key\": \"SMTP_PORT\", \"value\": \"587\"},
-                {\"key\": \"SMTP_USER\", \"value\": \"hello@rezthegiant.com\"},
-                {\"key\": \"SMTP_PASS\", \"value\": \"$APP_PASSWORD\"},
-                {\"key\": \"SMTP_FROM\", \"value\": \"hello@rezthegiant.com\"},
-                {\"key\": \"DB_PATH\", \"value\": \"/tmp/agency_outreach.db\"},
-                {\"key\": \"SETTINGS_PATH\", \"value\": \"/tmp/agency_settings.json\"}
-            ]
-        }")
+        -H "Accept: application/json")
+
+    OWNER_ID=$(echo "$OWNER_RESPONSE" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if isinstance(data, list) and len(data) > 0:
+    owner = data[0].get('owner', data[0])
+    print(owner.get('id', ''))
+else:
+    print('')
+" 2>/dev/null || echo "")
+
+    if [ -z "$OWNER_ID" ]; then
+        echo -e "${RED}Could not fetch Render owner ID. API response:${NC}"
+        echo "$OWNER_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$OWNER_RESPONSE"
+        echo ""
+        echo -e "${YELLOW}Falling back to manual deployment...${NC}"
+        RENDER_API_KEY=""
+    else
+        echo -e "${GREEN}✓ Render account found (ID: $OWNER_ID)${NC}"
+
+        echo -e "${YELLOW}→ Creating Render web service...${NC}"
+
+        # Get SMTP password
+        echo -e "${YELLOW}→ Email setup for outreach automation${NC}"
+        echo -e "  Your bot sends emails from: ${CYAN}hello@rezthegiant.com${NC}"
+        echo -e "  You need a Google App Password."
+        echo -e "  (Get one at: ${CYAN}https://myaccount.google.com/apppasswords${NC})"
+        echo ""
+        read -sp "Enter your Google App Password (16 chars, no spaces — or press Enter to skip email setup): " APP_PASSWORD
+        echo ""
+
+        if [ -z "$APP_PASSWORD" ]; then
+            APP_PASSWORD="placeholder-set-in-render-dashboard-later"
+        fi
+
+        # Create the service via Render API (with ownerId)
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://api.render.com/v1/services" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"type\": \"web_service\",
+                \"name\": \"agency-outreach-bot\",
+                \"ownerId\": \"$OWNER_ID\",
+                \"repo\": \"$REPO_URL\",
+                \"autoDeploy\": \"yes\",
+                \"branch\": \"$(git branch --show-current)\",
+                \"serviceDetails\": {
+                    \"runtime\": \"python\",
+                    \"plan\": \"free\",
+                    \"startCommand\": \"python app.py\",
+                    \"envVars\": [
+                        {\"key\": \"PORT\", \"value\": \"10000\"},
+                        {\"key\": \"SMTP_HOST\", \"value\": \"smtp.gmail.com\"},
+                        {\"key\": \"SMTP_PORT\", \"value\": \"587\"},
+                        {\"key\": \"SMTP_USER\", \"value\": \"hello@rezthegiant.com\"},
+                        {\"key\": \"SMTP_PASS\", \"value\": \"$APP_PASSWORD\"},
+                        {\"key\": \"SMTP_FROM\", \"value\": \"hello@rezthegiant.com\"},
+                        {\"key\": \"DB_PATH\", \"value\": \"/tmp/agency_outreach.db\"},
+                        {\"key\": \"SETTINGS_PATH\", \"value\": \"/tmp/agency_settings.json\"}
+                    ]
+                }
+            }")
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -1)
     BODY=$(echo "$RESPONSE" | sed '$d')
@@ -206,6 +239,7 @@ if [ -n "$RENDER_API_KEY" ]; then
         echo -e "${YELLOW}Falling back to manual deployment...${NC}"
         RENDER_API_KEY=""
     fi
+    fi  # end owner ID check
 fi
 
 # ─── Fallback: Manual one-click deploy ───────────────────────────────────────
