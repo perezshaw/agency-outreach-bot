@@ -188,7 +188,7 @@ else:
                 \"autoDeploy\": \"yes\",
                 \"branch\": \"$(git branch --show-current)\",
                 \"serviceDetails\": {
-                    \"runtime\": \"python\",
+                    \"env\": \"python\",
                     \"plan\": \"free\",
                     \"startCommand\": \"python app.py\",
                     \"envVars\": [
