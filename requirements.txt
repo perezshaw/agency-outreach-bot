@@ -1,0 +1,14 @@
+# Agency Outreach Bot - No External Dependencies
+# Uses Python 3.10+ stdlib only
+#
+# Run with: python app.py
+#
+# Environment variables required:
+# - PORT (default: 5000)
+# - SMTP_HOST (default: smtp.gmail.com)
+# - SMTP_PORT (default: 587)
+# - SMTP_USER (required for email)
+# - SMTP_PASS (required for email, use Google App Password)
+# - SMTP_FROM (required for email, e.g., hello@rezthegiant.com)
+# - DB_PATH (default: /tmp/agency_outreach.db)
+# - SETTINGS_PATH (default: /tmp/agency_settings.json)

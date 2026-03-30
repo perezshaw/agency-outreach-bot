@@ -1,0 +1,1155 @@
+#!/usr/bin/env python3
+"""
+Agency Outreach Bot - Production-Ready Backend Server
+Runs on Python stdlib only (no external dependencies)
+"""
+
+import json
+import os
+import sqlite3
+import smtplib
+import re
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
+from pathlib import Path
+
+# Configuration
+PORT = int(os.environ.get('PORT', 5000))
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASS = os.environ.get('SMTP_PASS', '')
+SMTP_FROM = os.environ.get('SMTP_FROM', '')
+DB_PATH = os.environ.get('DB_PATH', '/tmp/agency_outreach.db')
+SETTINGS_PATH = os.environ.get('SETTINGS_PATH', '/tmp/agency_settings.json')
+BASE_DIR = Path(__file__).parent
+
+# Creator Data (embedded)
+CREATORS = {
+    "1": {
+        "id": "1",
+        "name": "Kalani Rodgers",
+        "niche": "Comedy",
+        "bio": "Stand-up comedian and comedy content creator with a focus on observational humor and social commentary.",
+        "platforms": {
+            "tiktok": {"handle": "@kalanirodgers", "followers": 450000, "engagement_rate": 8.2},
+            "instagram": {"handle": "@kalanirodgers", "followers": 320000, "engagement_rate": 7.5},
+            "youtube": {"handle": "Kalani Rodgers", "followers": 180000, "engagement_rate": 6.8},
+            "twitter": {"handle": "@kalanirodgers", "followers": 95000, "engagement_rate": 5.4}
+        },
+        "total_reach": 1045000,
+        "avg_engagement_rate": 7.0,
+        "verticals": ["Comedy", "Entertainment", "Lifestyle"],
+        "services": [
+            {"name": "TikTok/Instagram Reels", "rate": 2000, "per": "post"},
+            {"name": "YouTube Video", "rate": 5000, "per": "video"},
+            {"name": "Brand Collaboration", "rate": 10000, "per": "campaign"},
+            {"name": "Sponsored Stand-up", "rate": 8000, "per": "performance"}
+        ],
+        "pricing_tier": "$5-25K",
+        "audience": "18-34, diverse, comedy enthusiasts",
+        "contact_email": "kalani@rezagency.com",
+        "contact_phone": "+1-555-0101",
+        "rate_card_url": "https://rezagency.com/kalani-ratecard.pdf",
+        "brand_partnerships": [
+            {"brand": "BetterHelp", "status": "Active", "value": 15000},
+            {"brand": "Manscaped", "status": "Active", "value": 8000},
+            {"brand": "Square Cash", "status": "Completed", "value": 5000}
+        ],
+        "recent_posts": [
+            {"platform": "tiktok", "date": "2026-03-15", "views": 450000, "engagement": 32000},
+            {"platform": "instagram", "date": "2026-03-14", "views": 120000, "engagement": 8900},
+            {"platform": "youtube", "date": "2026-03-10", "views": 85000, "engagement": 5200}
+        ]
+    },
+    "2": {
+        "id": "2",
+        "name": "Coach Canela",
+        "niche": "Fitness",
+        "bio": "Certified fitness coach specializing in HIIT workouts, nutrition coaching, and fitness motivation. Building a community of health-conscious individuals.",
+        "platforms": {
+            "instagram": {"handle": "@coachcanela", "followers": 580000, "engagement_rate": 9.1},
+            "tiktok": {"handle": "@coachcanela", "followers": 720000, "engagement_rate": 10.3},
+            "youtube": {"handle": "Coach Canela", "followers": 420000, "engagement_rate": 8.7},
+            "pinterest": {"handle": "coachcanela", "followers": 250000, "engagement_rate": 6.2}
+        },
+        "total_reach": 1970000,
+        "avg_engagement_rate": 8.6,
+        "verticals": ["Fitness", "Wellness", "Health", "Apparel"],
+        "services": [
+            {"name": "Instagram Sponsorship", "rate": 3000, "per": "post"},
+            {"name": "TikTok Package (5 videos)", "rate": 8000, "per": "package"},
+            {"name": "YouTube Integration", "rate": 6000, "per": "video"},
+            {"name": "Fitness Program Collaboration", "rate": 20000, "per": "campaign"}
+        ],
+        "pricing_tier": "$25-100K",
+        "audience": "20-40, fitness-focused, women 65%, men 35%",
+        "contact_email": "canela@rezagency.com",
+        "contact_phone": "+1-555-0102",
+        "rate_card_url": "https://rezagency.com/canela-ratecard.pdf",
+        "brand_partnerships": [
+            {"brand": "Gymshark", "status": "Active", "value": 45000},
+            {"brand": "Alo Yoga", "status": "Active", "value": 35000},
+            {"brand": "Celsius Energy", "status": "Completed", "value": 12000},
+            {"brand": "Lululemon", "status": "Negotiating", "value": 50000}
+        ],
+        "recent_posts": [
+            {"platform": "tiktok", "date": "2026-03-16", "views": 680000, "engagement": 68000},
+            {"platform": "instagram", "date": "2026-03-15", "views": 240000, "engagement": 22000},
+            {"platform": "youtube", "date": "2026-03-12", "views": 125000, "engagement": 10800}
+        ]
+    },
+    "3": {
+        "id": "3",
+        "name": "Kayla Rae Ortiz",
+        "niche": "Wellness",
+        "bio": "Holistic wellness advocate, meditation instructor, and mental health champion. Focused on sustainable wellness practices and self-care education.",
+        "platforms": {
+            "instagram": {"handle": "@kaylarae.wellness", "followers": 420000, "engagement_rate": 9.8},
+            "tiktok": {"handle": "@kaylarae.wellness", "followers": 580000, "engagement_rate": 11.2},
+            "youtube": {"handle": "Kayla Rae Wellness", "followers": 310000, "engagement_rate": 9.5},
+            "podcast": {"name": "Wellness Chronicles", "listeners": 85000, "per_episode": 6500}
+        },
+        "total_reach": 1395000,
+        "avg_engagement_rate": 10.1,
+        "verticals": ["Wellness", "Health", "Beauty", "Lifestyle"],
+        "services": [
+            {"name": "Instagram Post", "rate": 2500, "per": "post"},
+            {"name": "TikTok Series (3 videos)", "rate": 6000, "per": "series"},
+            {"name": "YouTube Collaboration", "rate": 5500, "per": "video"},
+            {"name": "Podcast Integration", "rate": 8000, "per": "episode"},
+            {"name": "Wellness Workshop", "rate": 15000, "per": "session"}
+        ],
+        "pricing_tier": "$25-100K",
+        "audience": "20-45, wellness-focused, primarily female (72%), eco-conscious",
+        "contact_email": "kayla@rezagency.com",
+        "contact_phone": "+1-555-0103",
+        "rate_card_url": "https://rezagency.com/kayla-ratecard.pdf",
+        "brand_partnerships": [
+            {"brand": "Calm App", "status": "Active", "value": 25000},
+            {"brand": "BetterHelp", "status": "Active", "value": 22000},
+            {"brand": "Athletic Greens", "status": "Completed", "value": 18000},
+            {"brand": "Oura Ring", "status": "Active", "value": 20000}
+        ],
+        "recent_posts": [
+            {"platform": "tiktok", "date": "2026-03-17", "views": 520000, "engagement": 58000},
+            {"platform": "instagram", "date": "2026-03-16", "views": 185000, "engagement": 18150},
+            {"platform": "podcast", "date": "2026-03-14", "downloads": 12300, "engagement": 2100}
+        ]
+    }
+}
+
+# Outreach Templates
+TEMPLATES = {
+    "email": [
+        {
+            "id": "email_cold_intro",
+            "channel": "email",
+            "name": "Cold Introduction",
+            "subject": "Partnership Opportunity — {{creator_name}} x {{brand_name}}",
+            "body": """Hi {{contact_name}},
+
+I hope this email finds you well! I'm reaching out on behalf of {{creator_name}}, an exceptional {{niche}} creator with a highly engaged audience across social media.
+
+**Quick Stats:**
+• {{total_reach}}+ followers across platforms
+• {{avg_engagement_rate}}% average engagement rate
+• Audience: {{audience}}
+
+{{creator_name}} has successfully partnered with brands in your space and would be a great fit for {{brand_name}}. I'd love to explore a potential collaboration that drives real results for your brand.
+
+Would you be open to a brief conversation about partnership opportunities?
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com
+www.rezagency.com"""
+        },
+        {
+            "id": "email_follow_up",
+            "channel": "email",
+            "name": "Follow-Up Email",
+            "subject": "Re: Partnership Opportunity — {{creator_name}} x {{brand_name}}",
+            "body": """Hi {{contact_name}},
+
+I wanted to follow up on my previous email about {{creator_name}} and {{brand_name}}.
+
+Given {{creator_name}}'s strong alignment with {{brand_name}}'s target audience and proven track record with similar brands, I think this could be a really valuable partnership.
+
+Would this week be a good time for a quick 15-minute call to discuss potential collaboration options?
+
+Looking forward to hearing from you!
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        },
+        {
+            "id": "email_rate_card",
+            "channel": "email",
+            "name": "Rate Card & Pricing",
+            "subject": "{{creator_name}} — Rate Card & Collaboration Options",
+            "body": """Hi {{contact_name}},
+
+Thank you for your interest in working with {{creator_name}}!
+
+I'm attaching a detailed rate card that outlines collaboration options, pricing, and deliverables across platforms.
+
+**Quick Overview:**
+• Single platform posts: $2,500 - $5,000
+• Multi-platform campaigns: $10,000 - $50,000+
+• Custom collaborations: Let's discuss your goals
+
+{{creator_name}}'s audience is highly engaged and perfect for {{vertical}} brands. I'm confident we can create a campaign that delivers real ROI.
+
+Would you like to schedule a call to discuss custom package options?
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        },
+        {
+            "id": "email_multi_talent",
+            "channel": "email",
+            "name": "Multi-Talent Package",
+            "subject": "Multi-Creator Campaign Opportunity — {{brand_name}}",
+            "body": """Hi {{contact_name}},
+
+I represent three exceptional creators with diverse audiences and strong engagement metrics:
+
+**Available Talent:**
+1. {{creator_name}} — {{niche}} ({{total_reach}}+ followers)
+2. [Additional creator details available upon request]
+
+We can structure a comprehensive campaign that leverages multiple platforms and audience segments to maximize your brand's reach and impact.
+
+**Package Benefits:**
+• Cross-platform amplification
+• Diverse audience reach
+• Authentic brand advocacy
+• Flexible pricing and terms
+
+Would you be interested in exploring a multi-creator campaign for {{brand_name}}?
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        },
+        {
+            "id": "email_seasonal",
+            "channel": "email",
+            "name": "Seasonal Campaign Pitch",
+            "subject": "Spring Campaign Opportunity — {{creator_name}} x {{brand_name}}",
+            "body": """Hi {{contact_name}},
+
+With the season changing, it's the perfect time to refresh {{brand_name}}'s social strategy. {{creator_name}} is launching a seasonal content series and I think {{brand_name}} could be a perfect fit.
+
+**Campaign Details:**
+• 5-8 content pieces across platforms
+• Peak posting times for maximum reach
+• {{total_reach}}+ potential impressions
+• {{avg_engagement_rate}}% engagement baseline
+
+We can customize the approach to align with {{brand_name}}'s goals and timeline. Typically, these campaigns drive strong awareness and conversion results.
+
+Are you interested in a quick conversation to explore this opportunity?
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        },
+        {
+            "id": "email_post_meeting",
+            "channel": "email",
+            "name": "Post-Meeting Proposal",
+            "subject": "Following Up on Our Conversation — {{brand_name}} Partnership",
+            "body": """Hi {{contact_name}},
+
+Thank you for taking the time to discuss partnership opportunities with {{creator_name}} and {{brand_name}}. It was great to learn more about your goals and vision.
+
+Based on our conversation, I've outlined a custom proposal that I believe hits the mark:
+
+**Proposed Deliverables:**
+• {{total_reach}}+ audience reach
+• {{avg_engagement_rate}}% engagement rate
+• Multi-platform content series
+• Performance tracking and reporting
+
+I'm excited about the potential for this partnership. When you have a chance, please review the attached proposal and let me know your thoughts.
+
+Looking forward to moving forward together!
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        },
+        {
+            "id": "email_deal_proposal",
+            "channel": "email",
+            "name": "Deal Proposal & Terms",
+            "subject": "Partnership Proposal — {{creator_name}} & {{brand_name}} Deal Terms",
+            "body": """Hi {{contact_name}},
+
+I'm excited to send over the formal proposal for the {{creator_name}} and {{brand_name}} partnership.
+
+**Deal Summary:**
+• Campaign Duration: [TBD based on deliverables]
+• Content Deliverables: [Custom to your needs]
+• Budget: [Per attached proposal]
+• Timeline: [TBD]
+
+This package is designed to maximize {{brand_name}}'s visibility and drive measurable results with {{creator_name}}'s engaged audience.
+
+Please review and let me know if you'd like to discuss any adjustments to the terms or deliverables.
+
+I'm available for a call at your earliest convenience.
+
+Best regards,
+Rez | Talent Manager
+hello@rezthegiant.com"""
+        }
+    ],
+    "instagram_dm": [
+        {
+            "id": "ig_cold_intro",
+            "channel": "instagram_dm",
+            "name": "Cold Introduction",
+            "body": "Hey {{contact_name}}! 👋 I represent {{creator_name}}, an amazing {{niche}} creator with {{total_reach}}+ followers. Their audience is super engaged ({{avg_engagement_rate}}% engagement) and would be a great fit for {{brand_name}}. Would love to explore a potential collab! DM back if interested 🙌"
+        },
+        {
+            "id": "ig_follow_up",
+            "channel": "instagram_dm",
+            "name": "Follow-Up Message",
+            "body": "Hey {{contact_name}}, just following up on my previous message about {{creator_name}}. Think they'd be a great partner for {{brand_name}}'s upcoming campaigns. Let me know if you'd like to chat more! 💬"
+        },
+        {
+            "id": "ig_collab_pitch",
+            "channel": "instagram_dm",
+            "name": "Collaboration Pitch",
+            "body": "Hi {{contact_name}}! {{creator_name}} is interested in collaborating with {{brand_name}}. They have a highly engaged {{audience}} audience and create awesome {{niche}} content. Would love to set up a quick call to discuss! Are you open to it?"
+        },
+        {
+            "id": "ig_story_offer",
+            "channel": "instagram_dm",
+            "name": "Story Mention Offer",
+            "body": "Hey {{contact_name}}! {{creator_name}} would love to feature {{brand_name}} in their stories to their {{total_reach}}+ followers. Perfect for increasing brand awareness! Would you be interested? Let's chat! 🎉"
+        }
+    ],
+    "linkedin": [
+        {
+            "id": "linkedin_connection",
+            "channel": "linkedin",
+            "name": "Connection Request Note",
+            "body": "Hi {{contact_name}}, I'm Rez, a talent manager representing {{creator_name}}, an influential {{niche}} creator with {{total_reach}}+ followers. I see {{brand_name}} is expanding in the {{vertical}} space and think {{creator_name}} would be a great partnership fit. Would love to connect and explore collaboration opportunities!"
+        },
+        {
+            "id": "linkedin_inmail",
+            "channel": "linkedin",
+            "name": "InMail Introduction",
+            "subject": "Talent Partnership Opportunity — {{creator_name}} x {{brand_name}}",
+            "body": "Hi {{contact_name}},\n\nI'm reaching out because I believe {{creator_name}} would be an excellent partner for {{brand_name}}'s marketing initiatives.\n\n**Why {{creator_name}}?**\n• {{total_reach}}+ engaged followers\n• {{avg_engagement_rate}}% engagement rate\n• Proven results with {{vertical}} brands\n• Authentic audience alignment\n\nWould you be open to a brief conversation about how we can drive results together?\n\nBest regards,\nRez"
+        },
+        {
+            "id": "linkedin_followup",
+            "channel": "linkedin",
+            "name": "Connection Follow-Up",
+            "body": "Hi {{contact_name}}, following up on my previous message about {{creator_name}}. I think this partnership could deliver real value for {{brand_name}}. Would appreciate 15 minutes of your time to discuss. Thanks!"
+        }
+    ],
+    "tiktok": [
+        {
+            "id": "tiktok_cold_dm",
+            "channel": "tiktok",
+            "name": "Cold DM",
+            "body": "Hey {{contact_name}}! 👋 {{creator_name}} here representing talent partnerships for {{brand_name}}. {{creator_name}} is an awesome {{niche}} creator with {{total_reach}}+ followers and would be perfect for a collab. Interested? Let's chat! 🙌"
+        },
+        {
+            "id": "tiktok_collab",
+            "channel": "tiktok",
+            "name": "Collaboration Pitch",
+            "body": "Hey {{contact_name}}! {{creator_name}} wants to create some fire content with {{brand_name}}. {{total_reach}}+ followers, {{avg_engagement_rate}}% engagement. Perfect audience match for your brand. You down? 🔥"
+        },
+        {
+            "id": "tiktok_trending",
+            "channel": "tiktok",
+            "name": "Trending Content Hook",
+            "body": "{{contact_name}}, {{creator_name}} is hopping on the trending {{niche}} wave and thinks {{brand_name}} should be part of it! {{avg_engagement_rate}}% engagement rate = tons of visibility. Let's make viral content together! 🚀"
+        }
+    ]
+}
+
+# Seed Brands Data
+SEED_BRANDS = [
+    {"name": "Glossier", "vertical": "Beauty", "budget_tier": "$25-100K", "contact_name": "Sarah Chen", "contact_email": "partnerships@glossier.com", "contact_title": "Head of Influencer Partnerships", "website": "glossier.com", "instagram": "@glossier", "linkedin": "glossier", "tiktok": "@glossier"},
+    {"name": "Gymshark", "vertical": "Fitness/Apparel", "budget_tier": "$100K+", "contact_name": "Marcus Williams", "contact_email": "influencer@gymshark.com", "contact_title": "Director of Creator Relations", "website": "gymshark.com", "instagram": "@gymshark", "linkedin": "gymshark", "tiktok": "@gymshark"},
+    {"name": "Alo Yoga", "vertical": "Fitness/Wellness", "budget_tier": "$100K+", "contact_name": "Jessica Rodriguez", "contact_email": "creators@aloyoga.com", "contact_title": "Influencer Manager", "website": "aloyoga.com", "instagram": "@aloyoga", "linkedin": "alo-yoga", "tiktok": "@aloyoga"},
+    {"name": "Fashion Nova", "vertical": "Fashion", "budget_tier": "$100K+", "contact_name": "Brandon Lee", "contact_email": "partnerships@fashionnova.com", "contact_title": "Talent Manager", "website": "fashionnova.com", "instagram": "@fashionnova", "linkedin": "fashion-nova", "tiktok": "@fashionnova"},
+    {"name": "Fabletics", "vertical": "Fitness/Apparel", "budget_tier": "$25-100K", "contact_name": "Nicole Adams", "contact_email": "creators@fabletics.com", "contact_title": "Partnership Coordinator", "website": "fabletics.com", "instagram": "@fabletics", "linkedin": "fabletics", "tiktok": "@fabletics"},
+    {"name": "Lululemon", "vertical": "Fitness/Apparel", "budget_tier": "$100K+", "contact_name": "David Park", "contact_email": "partnerships@lululemon.com", "contact_title": "Creator Marketing Manager", "website": "lululemon.com", "instagram": "@lululemon", "linkedin": "lululemon", "tiktok": "@lululemon"},
+    {"name": "Nike", "vertical": "Sports/Fitness", "budget_tier": "$100K+", "contact_name": "Ashley Thompson", "contact_email": "athlete-partnerships@nike.com", "contact_title": "Influencer Relations Lead", "website": "nike.com", "instagram": "@nike", "linkedin": "nike", "tiktok": "@nike"},
+    {"name": "Sephora", "vertical": "Beauty", "budget_tier": "$100K+", "contact_name": "Michelle Zhang", "contact_email": "influencers@sephora.com", "contact_title": "Head of Social Marketing", "website": "sephora.com", "instagram": "@sephora", "linkedin": "sephora", "tiktok": "@sephora"},
+    {"name": "Savage X Fenty", "vertical": "Fashion/Beauty", "budget_tier": "$100K+", "contact_name": "Keisha Brown", "contact_email": "partnerships@savagex.com", "contact_title": "Brand Partnerships Manager", "website": "savagex.fenty.com", "instagram": "@savagex", "linkedin": "rihanna-fenty", "tiktok": "@savagex"},
+    {"name": "PrettyLittleThing", "vertical": "Fashion", "budget_tier": "$25-100K", "contact_name": "Amara Johnson", "contact_email": "partnerships@prettylittlething.com", "contact_title": "Influencer Coordinator", "website": "prettylittlething.com", "instagram": "@prettylittlething", "linkedin": "prettylittlething", "tiktok": "@prettylittlething"},
+    {"name": "Celsius Energy", "vertical": "Food & Beverage", "budget_tier": "$25-100K", "contact_name": "Tyler Martinez", "contact_email": "partnerships@celsius.com", "contact_title": "Creator Relations Manager", "website": "celsius.com", "instagram": "@celsius", "linkedin": "celsius-energy-drink", "tiktok": "@celsius"},
+    {"name": "Bloom Nutrition", "vertical": "Supplements", "budget_tier": "$5-25K", "contact_name": "Lauren Foster", "contact_email": "collaborations@bloom.co", "contact_title": "Brand Partnerships", "website": "bloomnutrition.com", "instagram": "@bloomnutrition", "linkedin": "bloom-nutrition", "tiktok": "@bloomnutrition"},
+    {"name": "Liquid IV", "vertical": "Health/Beverage", "budget_tier": "$25-100K", "contact_name": "Chris Anderson", "contact_email": "influencers@liquidiv.com", "contact_title": "Partnerships Manager", "website": "liquid-iv.com", "instagram": "@liquidiv", "linkedin": "liquid-iv", "tiktok": "@liquidiv"},
+    {"name": "HelloFresh", "vertical": "Food", "budget_tier": "$100K+", "contact_name": "Rebecca Cohen", "contact_email": "influencer-team@hellofresh.com", "contact_title": "Influencer Marketing Manager", "website": "hellofresh.com", "instagram": "@hellofresh", "linkedin": "hellofresh", "tiktok": "@hellofresh"},
+    {"name": "BetterHelp", "vertical": "Wellness/Health", "budget_tier": "$100K+", "contact_name": "Dr. James Wilson", "contact_email": "partnerships@betterhelp.com", "contact_title": "Director of Brand Partnerships", "website": "betterhelp.com", "instagram": "@betterhelp", "linkedin": "betterhelp", "tiktok": "@betterhelp"},
+    {"name": "Calm App", "vertical": "Wellness/Tech", "budget_tier": "$25-100K", "contact_name": "Emma Davis", "contact_email": "partnerships@calm.com", "contact_title": "Brand Partnerships Lead", "website": "calm.com", "instagram": "@calm", "linkedin": "calm", "tiktok": "@calm"},
+    {"name": "Oura Ring", "vertical": "Tech/Wellness", "budget_tier": "$25-100K", "contact_name": "Sophie Turner", "contact_email": "partnerships@ouraring.com", "contact_title": "Creator Partnerships Manager", "website": "ouraring.com", "instagram": "@ouraring", "linkedin": "oura", "tiktok": "@ouraring"},
+    {"name": "Athletic Greens", "vertical": "Supplements", "budget_tier": "$25-100K", "contact_name": "Michael Khan", "contact_email": "partnerships@athleticgreens.com", "contact_title": "Influencer Relations", "website": "athleticgreens.com", "instagram": "@athleticgreens", "linkedin": "athletic-greens", "tiktok": "@athleticgreens"},
+    {"name": "Skims", "vertical": "Fashion", "budget_tier": "$100K+", "contact_name": "Priya Patel", "contact_email": "collaborations@skims.com", "contact_title": "Creator Relations Manager", "website": "skims.com", "instagram": "@skims", "linkedin": "skims", "tiktok": "@skims"},
+    {"name": "Rare Beauty", "vertical": "Beauty", "budget_tier": "$100K+", "contact_name": "Olivia Grant", "contact_email": "partnerships@rarebeauty.com", "contact_title": "Brand Partnerships Manager", "website": "rarebeauty.com", "instagram": "@rarebeauty", "linkedin": "rare-beauty", "tiktok": "@rarebeauty"},
+    {"name": "Drunk Elephant", "vertical": "Beauty/Skincare", "budget_tier": "$25-100K", "contact_name": "Ryan Kelly", "contact_email": "influencer@drunkelephant.com", "contact_title": "Partnerships Coordinator", "website": "drunkelephant.com", "instagram": "@drunkelephant", "linkedin": "drunk-elephant", "tiktok": "@drunkelephant"},
+    {"name": "Manduka", "vertical": "Yoga/Fitness", "budget_tier": "$5-25K", "contact_name": "Sophia Martinez", "contact_email": "partnerships@manduka.com", "contact_title": "Creator Relations", "website": "manduka.com", "instagram": "@manduka", "linkedin": "manduka", "tiktok": "@manduka"},
+    {"name": "Vuori", "vertical": "Apparel/Fitness", "budget_tier": "$25-100K", "contact_name": "Jordan Hayes", "contact_email": "partnerships@vuori.com", "contact_title": "Influencer Manager", "website": "vuori.com", "instagram": "@vuoriclothing", "linkedin": "vuori", "tiktok": "@vuoriclothing"},
+    {"name": "Poppi", "vertical": "Food & Beverage", "budget_tier": "$5-25K", "contact_name": "Alexandra Blue", "contact_email": "partnerships@poppi.com", "contact_title": "Brand Partnerships", "website": "poppi.com", "instagram": "@poppibeverage", "linkedin": "poppi", "tiktok": "@poppibeverage"},
+    {"name": "Olipop", "vertical": "Food & Beverage", "budget_tier": "$5-25K", "contact_name": "Marcus Green", "contact_email": "partnerships@olipop.com", "contact_title": "Creator Relations Manager", "website": "olipop.com", "instagram": "@olipop", "linkedin": "olipop", "tiktok": "@olipop"}
+]
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler for Agency Outreach Bot API"""
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests"""
+        self.send_response(200)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+
+    def do_GET(self):
+        """Handle GET requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        query_params = parse_qs(parsed_path.query)
+
+        # Clean up query params (parse_qs returns lists)
+        params = {k: v[0] if v else '' for k, v in query_params.items()}
+
+        try:
+            # Routes
+            if path == '/':
+                self._serve_static('index.html')
+            elif path.startswith('/static/'):
+                self._serve_static(path[8:])
+            elif path == '/api/creators':
+                self._handle_get_creators()
+            elif path.startswith('/api/creators/'):
+                creator_id = path.split('/')[-1]
+                self._handle_get_creator(creator_id)
+            elif path == '/api/brands':
+                self._handle_get_brands(params)
+            elif path == '/api/brands/stats':
+                self._handle_brands_stats()
+            elif path == '/api/campaigns':
+                self._handle_get_campaigns(params)
+            elif path == '/api/campaigns/pipeline':
+                self._handle_campaigns_pipeline()
+            elif path == '/api/outreach/templates':
+                self._handle_get_templates()
+            elif path == '/api/analytics/overview':
+                self._handle_analytics_overview()
+            elif path == '/api/analytics/activity':
+                limit = int(params.get('limit', '50'))
+                self._handle_activity_feed(limit)
+            elif path == '/api/settings':
+                self._handle_get_settings()
+            else:
+                self._send_json(404, {'error': 'Not found'})
+        except Exception as e:
+            self._send_json(500, {'error': str(e)})
+
+    def do_POST(self):
+        """Handle POST requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+        data = json.loads(body) if body else {}
+
+        try:
+            if path == '/api/brands':
+                self._handle_create_brand(data)
+            elif path == '/api/campaigns':
+                self._handle_create_campaign(data)
+            elif path == '/api/outreach/compose':
+                self._handle_compose_message(data)
+            elif path == '/api/outreach/send-email':
+                self._handle_send_email(data)
+            elif path == '/api/outreach/log':
+                self._handle_log_outreach(data)
+            elif path == '/api/settings':
+                self._handle_save_settings(data)
+            else:
+                self._send_json(404, {'error': 'Not found'})
+        except Exception as e:
+            self._send_json(500, {'error': str(e)})
+
+    def do_PUT(self):
+        """Handle PUT requests"""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+        data = json.loads(body) if body else {}
+
+        try:
+            if path.startswith('/api/brands/'):
+                brand_id = path.split('/')[-1]
+                self._handle_update_brand(brand_id, data)
+            elif path.startswith('/api/campaigns/'):
+                campaign_id = path.split('/')[-1]
+                self._handle_update_campaign(campaign_id, data)
+            else:
+                self._send_json(404, {'error': 'Not found'})
+        except Exception as e:
+            self._send_json(500, {'error': str(e)})
+
+    def do_DELETE(self):
+        """Handle DELETE requests"""
+        path = urlparse(self.path).path
+
+        try:
+            if path.startswith('/api/brands/'):
+                brand_id = path.split('/')[-1]
+                self._handle_delete_brand(brand_id)
+            else:
+                self._send_json(404, {'error': 'Not found'})
+        except Exception as e:
+            self._send_json(500, {'error': str(e)})
+
+    # ============ Helper Methods ============
+
+    def _set_cors_headers(self):
+        """Set CORS headers"""
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+
+    def _send_json(self, status_code: int, data: Dict[str, Any]):
+        """Send JSON response"""
+        self.send_response(status_code)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        response = json.dumps(data)
+        self.wfile.write(response.encode('utf-8'))
+
+    def _serve_static(self, filename: str):
+        """Serve static files"""
+        static_dir = BASE_DIR / 'static'
+        if filename == '':
+            filename = 'index.html'
+
+        file_path = static_dir / filename
+        if file_path.exists() and file_path.is_file():
+            with open(file_path, 'rb') as f:
+                content = f.read()
+
+            self.send_response(200)
+            self._set_cors_headers()
+
+            # Determine content type
+            if filename.endswith('.html'):
+                self.send_header('Content-Type', 'text/html')
+            elif filename.endswith('.css'):
+                self.send_header('Content-Type', 'text/css')
+            elif filename.endswith('.js'):
+                self.send_header('Content-Type', 'application/javascript')
+            else:
+                self.send_header('Content-Type', 'application/octet-stream')
+
+            self.end_headers()
+            self.wfile.write(content)
+        else:
+            self._send_json(404, {'error': 'File not found'})
+
+    # ============ Database Methods ============
+
+    def _init_db(self):
+        """Initialize database with tables and seed data"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Create tables
+        c.execute('''CREATE TABLE IF NOT EXISTS brands (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            vertical TEXT,
+            contact_name TEXT,
+            contact_email TEXT,
+            contact_title TEXT,
+            website TEXT,
+            instagram TEXT,
+            linkedin TEXT,
+            tiktok TEXT,
+            budget_tier TEXT,
+            outreach_status TEXT DEFAULT 'New',
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS campaigns (
+            id TEXT PRIMARY KEY,
+            brand_id TEXT NOT NULL,
+            creator_id TEXT NOT NULL,
+            creator_name TEXT,
+            brand_name TEXT,
+            channel TEXT,
+            status TEXT DEFAULT 'Draft',
+            subject TEXT,
+            body TEXT,
+            value INTEGER,
+            notes TEXT,
+            last_activity TEXT,
+            created_at TEXT,
+            FOREIGN KEY(brand_id) REFERENCES brands(id)
+        )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS outreach_log (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT,
+            brand_id TEXT,
+            creator_id TEXT,
+            channel TEXT,
+            recipient TEXT,
+            subject TEXT,
+            body TEXT,
+            status TEXT DEFAULT 'sent',
+            sent_at TEXT,
+            opened_at TEXT,
+            replied_at TEXT,
+            FOREIGN KEY(brand_id) REFERENCES brands(id),
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+        )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS activity_log (
+            id TEXT PRIMARY KEY,
+            type TEXT,
+            message TEXT,
+            creator_id TEXT,
+            brand_id TEXT,
+            campaign_id TEXT,
+            created_at TEXT
+        )''')
+
+        conn.commit()
+
+        # Seed brands if empty
+        c.execute('SELECT COUNT(*) FROM brands')
+        if c.fetchone()[0] == 0:
+            now = datetime.utcnow().isoformat()
+            for brand in SEED_BRANDS:
+                brand_id = str(uuid.uuid4())
+                c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (brand_id, brand['name'], brand['vertical'], brand['contact_name'],
+                     brand['contact_email'], brand['contact_title'], brand['website'],
+                     brand['instagram'], brand['linkedin'], brand['tiktok'],
+                     brand['budget_tier'], 'New', None, now, now))
+            conn.commit()
+
+        conn.close()
+
+    def _get_db(self):
+        """Get database connection"""
+        return sqlite3.connect(DB_PATH)
+
+    # ============ API Handlers - Creators ============
+
+    def _handle_get_creators(self):
+        """GET /api/creators - List all creators"""
+        self._send_json(200, {'creators': list(CREATORS.values())})
+
+    def _handle_get_creator(self, creator_id: str):
+        """GET /api/creators/:id - Get single creator"""
+        creator = CREATORS.get(creator_id)
+        if creator:
+            self._send_json(200, creator)
+        else:
+            self._send_json(404, {'error': 'Creator not found'})
+
+    # ============ API Handlers - Brands ============
+
+    def _handle_get_brands(self, params: Dict[str, str]):
+        """GET /api/brands - List brands with filtering"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        query = 'SELECT * FROM brands WHERE 1=1'
+        filter_params = []
+
+        if params.get('vertical'):
+            query += ' AND vertical = ?'
+            filter_params.append(params['vertical'])
+
+        if params.get('status'):
+            query += ' AND outreach_status = ?'
+            filter_params.append(params['status'])
+
+        if params.get('search'):
+            query += ' AND (name LIKE ? OR contact_email LIKE ?)'
+            search_term = f"%{params['search']}%"
+            filter_params.extend([search_term, search_term])
+
+        c.execute(query, filter_params)
+        brands = [dict(zip([col[0] for col in c.description], row)) for row in c.fetchall()]
+        conn.close()
+
+        self._send_json(200, {'brands': brands})
+
+    def _handle_brands_stats(self):
+        """GET /api/brands/stats - Get brand statistics"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT outreach_status, COUNT(*) FROM brands GROUP BY outreach_status')
+        status_counts = {row[0]: row[1] for row in c.fetchall()}
+
+        c.execute('SELECT vertical, COUNT(*) FROM brands GROUP BY vertical')
+        vertical_counts = {row[0]: row[1] for row in c.fetchall()}
+
+        c.execute('SELECT COUNT(*) FROM brands')
+        total = c.fetchone()[0]
+
+        conn.close()
+
+        self._send_json(200, {
+            'total': total,
+            'by_status': status_counts,
+            'by_vertical': vertical_counts
+        })
+
+    def _handle_create_brand(self, data: Dict[str, Any]):
+        """POST /api/brands - Create brand"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        brand_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (brand_id, data.get('name'), data.get('vertical'), data.get('contact_name'),
+             data.get('contact_email'), data.get('contact_title'), data.get('website'),
+             data.get('instagram'), data.get('linkedin'), data.get('tiktok'),
+             data.get('budget_tier'), 'New', data.get('notes'), now, now))
+        conn.commit()
+        conn.close()
+
+        self._log_activity('brand_created', f"Brand '{data.get('name')}' created", None, brand_id, None)
+        self._send_json(201, {'id': brand_id, **data, 'created_at': now})
+
+    def _handle_update_brand(self, brand_id: str, data: Dict[str, Any]):
+        """PUT /api/brands/:id - Update brand"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        now = datetime.utcnow().isoformat()
+        updates = []
+        params = []
+
+        for field in ['name', 'vertical', 'contact_name', 'contact_email', 'contact_title',
+                      'website', 'instagram', 'linkedin', 'tiktok', 'budget_tier', 'outreach_status', 'notes']:
+            if field in data:
+                updates.append(f'{field} = ?')
+                params.append(data[field])
+
+        if updates:
+            updates.append('updated_at = ?')
+            params.append(now)
+            params.append(brand_id)
+
+            query = f"UPDATE brands SET {', '.join(updates)} WHERE id = ?"
+            c.execute(query, params)
+            conn.commit()
+
+        conn.close()
+        self._log_activity('brand_updated', f"Brand updated", None, brand_id, None)
+        self._send_json(200, {'id': brand_id, **data, 'updated_at': now})
+
+    def _handle_delete_brand(self, brand_id: str):
+        """DELETE /api/brands/:id - Delete brand"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('DELETE FROM brands WHERE id = ?', (brand_id,))
+        conn.commit()
+        conn.close()
+
+        self._send_json(200, {'deleted': True})
+
+    # ============ API Handlers - Campaigns ============
+
+    def _handle_get_campaigns(self, params: Dict[str, str]):
+        """GET /api/campaigns - List campaigns"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        query = 'SELECT * FROM campaigns WHERE 1=1'
+        filter_params = []
+
+        if params.get('creator_id'):
+            query += ' AND creator_id = ?'
+            filter_params.append(params['creator_id'])
+
+        if params.get('status'):
+            query += ' AND status = ?'
+            filter_params.append(params['status'])
+
+        c.execute(query, filter_params)
+        campaigns = [dict(zip([col[0] for col in c.description], row)) for row in c.fetchall()]
+        conn.close()
+
+        self._send_json(200, {'campaigns': campaigns})
+
+    def _handle_campaigns_pipeline(self):
+        """GET /api/campaigns/pipeline - Kanban pipeline stats"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT status, COUNT(*) FROM campaigns GROUP BY status')
+        pipeline = {row[0]: row[1] for row in c.fetchall()}
+
+        conn.close()
+        self._send_json(200, pipeline)
+
+    def _handle_create_campaign(self, data: Dict[str, Any]):
+        """POST /api/campaigns - Create campaign"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        # Get creator and brand names
+        creator = CREATORS.get(data.get('creator_id'), {})
+        creator_name = creator.get('name', '')
+
+        c.execute('SELECT name FROM brands WHERE id = ?', (data.get('brand_id'),))
+        row = c.fetchone()
+        brand_name = row[0] if row else ''
+
+        campaign_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        c.execute('''INSERT INTO campaigns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (campaign_id, data.get('brand_id'), data.get('creator_id'), creator_name,
+             brand_name, data.get('channel'), 'Draft', data.get('subject'),
+             data.get('body'), data.get('value', 0), data.get('notes'), now, now))
+        conn.commit()
+        conn.close()
+
+        self._log_activity('campaign_created', f"Campaign created: {creator_name} → {brand_name}",
+                          data.get('creator_id'), data.get('brand_id'), campaign_id)
+        self._send_json(201, {'id': campaign_id, **data, 'created_at': now})
+
+    def _handle_update_campaign(self, campaign_id: str, data: Dict[str, Any]):
+        """PUT /api/campaigns/:id - Update campaign"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        now = datetime.utcnow().isoformat()
+        updates = []
+        params = []
+
+        for field in ['status', 'subject', 'body', 'value', 'notes', 'channel']:
+            if field in data:
+                updates.append(f'{field} = ?')
+                params.append(data[field])
+
+        if updates:
+            updates.append('last_activity = ?')
+            params.append(now)
+            params.append(campaign_id)
+
+            query = f"UPDATE campaigns SET {', '.join(updates)} WHERE id = ?"
+            c.execute(query, params)
+            conn.commit()
+
+        conn.close()
+        self._log_activity('campaign_updated', f"Campaign updated: status={data.get('status')}",
+                          None, None, campaign_id)
+        self._send_json(200, {'id': campaign_id, **data})
+
+    # ============ API Handlers - Outreach ============
+
+    def _handle_get_templates(self):
+        """GET /api/outreach/templates - Get all templates"""
+        organized = {}
+        for channel, templates in TEMPLATES.items():
+            organized[channel] = templates
+
+        self._send_json(200, organized)
+
+    def _handle_compose_message(self, data: Dict[str, Any]):
+        """POST /api/outreach/compose - Compose message from template"""
+        template_id = data.get('template_id')
+        creator_id = data.get('creator_id')
+        brand_id = data.get('brand_id')
+
+        creator = CREATORS.get(creator_id, {})
+
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM brands WHERE id = ?', (brand_id,))
+        brand_row = c.fetchone()
+        conn.close()
+
+        if not brand_row:
+            self._send_json(404, {'error': 'Brand not found'})
+            return
+
+        brand_cols = [col[0] for col in c.description] if c.description else []
+        brand = dict(zip(brand_cols, brand_row)) if brand_row else {}
+
+        # Find template
+        template = None
+        for channel_templates in TEMPLATES.values():
+            for t in channel_templates:
+                if t['id'] == template_id:
+                    template = t
+                    break
+
+        if not template:
+            self._send_json(404, {'error': 'Template not found'})
+            return
+
+        # Compose message by replacing placeholders
+        placeholders = {
+            'creator_name': creator.get('name', ''),
+            'creator_niche': creator.get('niche', ''),
+            'total_reach': f"{creator.get('total_reach', 0):,}",
+            'avg_engagement_rate': f"{creator.get('avg_engagement_rate', 0):.1f}",
+            'audience': creator.get('audience', ''),
+            'niche': creator.get('niche', ''),
+            'brand_name': brand.get('name', ''),
+            'contact_name': brand.get('contact_name', ''),
+            'vertical': brand.get('vertical', '')
+        }
+
+        subject = template.get('subject', '')
+        body = template.get('body', '')
+
+        for key, value in placeholders.items():
+            subject = subject.replace(f'{{{{{key}}}}}', str(value))
+            body = body.replace(f'{{{{{key}}}}}', str(value))
+
+        self._send_json(200, {
+            'subject': subject,
+            'body': body,
+            'template_id': template_id,
+            'channel': template.get('channel')
+        })
+
+    def _handle_send_email(self, data: Dict[str, Any]):
+        """POST /api/outreach/send-email - Actually send email"""
+        to_email = data.get('to')
+        subject = data.get('subject')
+        body = data.get('body')
+        creator_id = data.get('creator_id')
+        brand_id = data.get('brand_id')
+        campaign_id = data.get('campaign_id')
+
+        try:
+            # Send email via SMTP
+            send_email(to_email, subject, body)
+
+            # Log the outreach
+            self._init_db()
+            log_id = str(uuid.uuid4())
+            now = datetime.utcnow().isoformat()
+
+            conn = self._get_db()
+            c = conn.cursor()
+            c.execute('''INSERT INTO outreach_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (log_id, campaign_id, brand_id, creator_id, 'email', to_email,
+                 subject, body, 'sent', now, None, None))
+
+            # Update campaign status if needed
+            if campaign_id:
+                c.execute('UPDATE campaigns SET status = ? WHERE id = ?', ('Sent', campaign_id))
+
+            # Update brand outreach status
+            if brand_id:
+                c.execute('UPDATE brands SET outreach_status = ? WHERE id = ?', ('Outreached', brand_id))
+
+            conn.commit()
+            conn.close()
+
+            self._log_activity('email_sent', f"Email sent to {to_email}",
+                             creator_id, brand_id, campaign_id)
+
+            self._send_json(200, {'sent': True, 'id': log_id})
+        except Exception as e:
+            self._send_json(500, {'error': f'Failed to send email: {str(e)}'})
+
+    def _handle_log_outreach(self, data: Dict[str, Any]):
+        """POST /api/outreach/log - Log manual outreach"""
+        self._init_db()
+        log_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        conn = self._get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO outreach_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (log_id, data.get('campaign_id'), data.get('brand_id'), data.get('creator_id'),
+             data.get('channel'), data.get('recipient'), data.get('subject', ''),
+             data.get('body', ''), 'sent', now, None, None))
+
+        if data.get('brand_id'):
+            c.execute('UPDATE brands SET outreach_status = ? WHERE id = ?',
+                     ('Outreached', data.get('brand_id')))
+
+        conn.commit()
+        conn.close()
+
+        self._log_activity('outreach_logged', f"{data.get('channel')} outreach logged",
+                          data.get('creator_id'), data.get('brand_id'), data.get('campaign_id'))
+
+        self._send_json(201, {'id': log_id})
+
+    # ============ API Handlers - Analytics ============
+
+    def _handle_analytics_overview(self):
+        """GET /api/analytics/overview - Analytics dashboard"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT COUNT(*) FROM outreach_log')
+        total_outreach = c.fetchone()[0]
+
+        c.execute('SELECT COUNT(*) FROM outreach_log WHERE replied_at IS NOT NULL')
+        replies = c.fetchone()[0]
+
+        c.execute('SELECT SUM(value) FROM campaigns WHERE status = ?', ('Closed Won',))
+        pipeline_value = c.fetchone()[0] or 0
+
+        c.execute('SELECT COUNT(*) FROM campaigns WHERE status = ?', ('Closed Won',))
+        deals_closed = c.fetchone()[0]
+
+        conn.close()
+
+        response_rate = (replies / total_outreach * 100) if total_outreach > 0 else 0
+
+        self._send_json(200, {
+            'total_outreach': total_outreach,
+            'response_rate': round(response_rate, 1),
+            'pipeline_value': pipeline_value,
+            'deals_closed': deals_closed
+        })
+
+    def _handle_activity_feed(self, limit: int):
+        """GET /api/analytics/activity - Recent activity feed"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ?', (limit,))
+        activities = [dict(zip([col[0] for col in c.description], row)) for row in c.fetchall()]
+        conn.close()
+
+        self._send_json(200, {'activities': activities})
+
+    # ============ API Handlers - Settings ============
+
+    def _handle_get_settings(self):
+        """GET /api/settings - Get current settings"""
+        if Path(SETTINGS_PATH).exists():
+            with open(SETTINGS_PATH, 'r') as f:
+                settings = json.load(f)
+        else:
+            settings = {
+                'company_name': 'Rez Agency',
+                'email': SMTP_FROM,
+                'reply_to': SMTP_FROM,
+                'signature': 'Rez | Talent Manager'
+            }
+
+        self._send_json(200, settings)
+
+    def _handle_save_settings(self, data: Dict[str, Any]):
+        """POST /api/settings - Save settings"""
+        with open(SETTINGS_PATH, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        self._send_json(200, {'saved': True})
+
+    # ============ Helper Methods ============
+
+    def _log_activity(self, activity_type: str, message: str, creator_id: Optional[str] = None,
+                      brand_id: Optional[str] = None, campaign_id: Optional[str] = None):
+        """Log activity to activity log"""
+        self._init_db()
+        activity_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        conn = self._get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO activity_log VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (activity_id, activity_type, message, creator_id, brand_id, campaign_id, now))
+        conn.commit()
+        conn.close()
+
+    def log_message(self, format, *args):
+        """Override to suppress default logging"""
+        pass
+
+
+def send_email(to_email: str, subject: str, body_html: str, from_name: str = "Rez | Talent Manager") -> bool:
+    """Send email via Google Workspace SMTP"""
+    if not SMTP_USER or not SMTP_PASS or not SMTP_FROM:
+        raise Exception("SMTP credentials not configured")
+
+    msg = MIMEMultipart('alternative')
+    msg['From'] = f'{from_name} <{SMTP_FROM}>'
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg['Reply-To'] = SMTP_FROM
+
+    # Plain text version
+    text_body = body_html.replace('<br>', '\n').replace('</p>', '\n')
+    text_part = MIMEText(text_body, 'plain')
+
+    # HTML version with styling
+    html_body = f'''<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
+{body_html}
+<br><br>
+<p style="color: #666; font-size: 12px;">—<br>Rez | Talent Manager<br>{SMTP_FROM}</p>
+</body></html>'''
+    html_part = MIMEText(html_body, 'html')
+
+    msg.attach(text_part)
+    msg.attach(html_part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+    return True
+
+
+def run_server():
+    """Start the HTTP server"""
+    server_address = ('0.0.0.0', PORT)
+    httpd = HTTPServer(server_address, RequestHandler)
+    print(f'Server running on port {PORT}')
+    httpd.serve_forever()
+
+
+if __name__ == '__main__':
+    run_server()
