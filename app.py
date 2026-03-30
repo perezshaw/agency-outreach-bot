@@ -434,7 +434,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         try:
             # Routes
-            if path == '/':
+            if path == '/healthz' or path == '/health':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode())
+                return
+            elif path == '/':
                 self._serve_static('index.html')
             elif path.startswith('/static/'):
                 self._serve_static(path[8:])
