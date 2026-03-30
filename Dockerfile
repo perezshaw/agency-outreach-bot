@@ -6,8 +6,9 @@ WORKDIR /app
 COPY app.py .
 COPY static/ static/
 
-# Expose port (Cloud Run sets PORT env var)
-EXPOSE 8080
+# Set default port for Render
+ENV PORT=10000
+EXPOSE 10000
 
 # Run the server
 CMD ["python", "app.py"]
