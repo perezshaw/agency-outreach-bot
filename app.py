@@ -9,6 +9,12 @@ import os
 import sqlite3
 import smtplib
 import re
+import csv
+import io
+import threading
+import time
+import secrets
+import urllib.request
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -28,6 +34,10 @@ SMTP_FROM = os.environ.get('SMTP_FROM', '')
 DB_PATH = os.environ.get('DB_PATH', '/tmp/agency_outreach.db')
 SETTINGS_PATH = os.environ.get('SETTINGS_PATH', '/tmp/agency_settings.json')
 BASE_DIR = Path(__file__).parent
+APP_PASSWORD = os.environ.get('APP_PASSWORD', 'RezTheGiant2024')
+
+# Session store (in-memory)
+VALID_SESSIONS = set()
 
 # Creator Data (embedded)
 CREATORS = {
@@ -433,14 +443,24 @@ class RequestHandler(BaseHTTPRequestHandler):
         params = {k: v[0] if v else '' for k, v in query_params.items()}
 
         try:
-            # Routes
+            # Routes that don't require authentication
             if path == '/healthz' or path == '/health':
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "ok"}).encode())
                 return
-            elif path == '/':
+            elif path == '/login':
+                self._serve_login_page()
+                return
+
+            # Check authentication for all other routes
+            if not self._check_session():
+                self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+                return
+
+            # Protected routes
+            if path == '/':
                 self._serve_static('index.html')
             elif path.startswith('/static/'):
                 self._serve_static(path[8:])
@@ -475,6 +495,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         """Handle POST requests"""
         parsed_path = urlparse(self.path)
         path = parsed_path.path
+
+        # Login endpoints don't require session
+        if path == '/api/login':
+            self._handle_login()
+            return
+        elif path == '/api/logout':
+            self._handle_logout()
+            return
+
+        # Check authentication for all other routes
+        if not self._check_session():
+            self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+            return
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length).decode('utf-8')
         data = json.loads(body) if body else {}
@@ -482,6 +516,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             if path == '/api/brands':
                 self._handle_create_brand(data)
+            elif path == '/api/brands/upload':
+                self._handle_upload_brands(content_length)
             elif path == '/api/campaigns':
                 self._handle_create_campaign(data)
             elif path == '/api/outreach/compose':
@@ -499,6 +535,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         """Handle PUT requests"""
+        # Check authentication
+        if not self._check_session():
+            self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+            return
+
         parsed_path = urlparse(self.path)
         path = parsed_path.path
         content_length = int(self.headers.get('Content-Length', 0))
@@ -519,6 +560,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         """Handle DELETE requests"""
+        # Check authentication
+        if not self._check_session():
+            self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+            return
+
         path = urlparse(self.path).path
 
         try:
@@ -529,6 +575,199 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
             self._send_json(500, {'error': str(e)})
+
+    # ============ Authentication Methods ============
+
+    def _check_session(self) -> bool:
+        """Check if request has valid session cookie"""
+        cookie_header = self.headers.get('Cookie', '')
+        if 'session_id=' in cookie_header:
+            session_id = cookie_header.split('session_id=')[1].split(';')[0].strip()
+            return session_id in VALID_SESSIONS
+        return False
+
+    def _serve_login_page(self):
+        """Serve the login page with dark theme"""
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agency Outreach Bot - Login</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #0f0f1e 0%, #1a1a2e 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #fff;
+        }
+        .container {
+            width: 100%;
+            max-width: 400px;
+            padding: 20px;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 40px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        h1 {
+            margin-bottom: 10px;
+            font-size: 28px;
+            text-align: center;
+        }
+        .subtitle {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.9);
+        }
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #fff;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+        input[type="password"]:focus {
+            outline: none;
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.25);
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05);
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(102, 126, 234, 0.4);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .error {
+            color: #ff6b6b;
+            font-size: 13px;
+            margin-top: 10px;
+            display: none;
+        }
+        .error.show {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Agency Bot</h1>
+            <p class="subtitle">Enter password to continue</p>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" placeholder="Enter password" required autofocus>
+                </div>
+                <button type="submit">Login</button>
+                <div class="error" id="error"></div>
+            </form>
+        </div>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const password = document.getElementById('password').value;
+            const errorDiv = document.getElementById('error');
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+
+                if (response.ok) {
+                    window.location.href = '/';
+                } else {
+                    errorDiv.textContent = 'Invalid password';
+                    errorDiv.classList.add('show');
+                }
+            } catch (err) {
+                errorDiv.textContent = 'Login failed: ' + err.message;
+                errorDiv.classList.add('show');
+            }
+        });
+    </script>
+</body>
+</html>"""
+        self.send_response(200)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def _handle_login(self):
+        """POST /api/login - Check password and create session"""
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+        data = json.loads(body) if body else {}
+
+        password = data.get('password', '')
+
+        if password == APP_PASSWORD:
+            session_id = secrets.token_urlsafe(32)
+            VALID_SESSIONS.add(session_id)
+
+            self.send_response(200)
+            self._set_cors_headers()
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Set-Cookie', f'session_id={session_id}; Path=/; HttpOnly; SameSite=Strict')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': True}).encode())
+        else:
+            self._send_json(401, {'error': 'Invalid password'})
+
+    def _handle_logout(self):
+        """POST /api/logout - Clear session"""
+        cookie_header = self.headers.get('Cookie', '')
+        if 'session_id=' in cookie_header:
+            session_id = cookie_header.split('session_id=')[1].split(';')[0].strip()
+            VALID_SESSIONS.discard(session_id)
+
+        self.send_response(200)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Set-Cookie', 'session_id=; Path=/; Max-Age=0')
+        self.end_headers()
+        self.wfile.write(json.dumps({'success': True}).encode())
 
     # ============ Helper Methods ============
 
@@ -612,11 +851,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             status TEXT DEFAULT 'Draft',
             subject TEXT,
             body TEXT,
-            value INTEGER,
+            value REAL DEFAULT 0,
             notes TEXT,
-            last_activity TEXT,
             created_at TEXT,
-            FOREIGN KEY(brand_id) REFERENCES brands(id)
+            last_activity TEXT
         )''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS outreach_log (
@@ -628,17 +866,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             recipient TEXT,
             subject TEXT,
             body TEXT,
-            status TEXT DEFAULT 'sent',
+            status TEXT,
             sent_at TEXT,
-            opened_at TEXT,
             replied_at TEXT,
-            FOREIGN KEY(brand_id) REFERENCES brands(id),
-            FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
+            notes TEXT
         )''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS activity_log (
             id TEXT PRIMARY KEY,
-            type TEXT,
+            activity_type TEXT,
             message TEXT,
             creator_id TEXT,
             brand_id TEXT,
@@ -648,12 +884,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         conn.commit()
 
-        # Seed brands if empty
+        # Seed brands if table is empty
         c.execute('SELECT COUNT(*) FROM brands')
         if c.fetchone()[0] == 0:
-            now = datetime.utcnow().isoformat()
             for brand in SEED_BRANDS:
                 brand_id = str(uuid.uuid4())
+                now = datetime.utcnow().isoformat()
                 c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                     (brand_id, brand['name'], brand['vertical'], brand['contact_name'],
                      brand['contact_email'], brand['contact_title'], brand['website'],
@@ -794,6 +1030,88 @@ class RequestHandler(BaseHTTPRequestHandler):
         conn.close()
 
         self._send_json(200, {'deleted': True})
+
+    def _handle_upload_brands(self, content_length: int):
+        """POST /api/brands/upload - Upload brands from CSV"""
+        try:
+            # Parse multipart form data
+            content_type = self.headers.get('Content-Type', '')
+
+            if 'multipart/form-data' not in content_type:
+                self._send_json(400, {'error': 'Expected multipart/form-data'})
+                return
+
+            # Extract boundary
+            boundary = content_type.split('boundary=')[1].encode() if 'boundary=' in content_type else b''
+            body = self.rfile.read(content_length)
+
+            # Simple multipart parser for file extraction
+            parts = body.split(b'--' + boundary)
+            csv_data = None
+
+            for part in parts:
+                if b'filename=' in part and b'text/csv' in part or b'application/vnd.ms-excel' in part:
+                    # Extract file content
+                    lines = part.split(b'\r\n')
+                    # Find the empty line that separates headers from content
+                    for i, line in enumerate(lines):
+                        if line == b'':
+                            csv_data = b'\r\n'.join(lines[i+1:-2])
+                            break
+
+            if not csv_data:
+                self._send_json(400, {'error': 'No CSV file found in upload'})
+                return
+
+            # Parse CSV
+            csv_text = csv_data.decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(csv_text))
+
+            self._init_db()
+            conn = self._get_db()
+            c = conn.cursor()
+
+            added = 0
+            updated = 0
+            now = datetime.utcnow().isoformat()
+
+            for row in csv_reader:
+                email = row.get('contact_email', '').strip()
+                if not email:
+                    continue
+
+                # Check if brand with this email exists
+                c.execute('SELECT id FROM brands WHERE contact_email = ?', (email,))
+                existing = c.fetchone()
+
+                if existing:
+                    # Update existing
+                    brand_id = existing[0]
+                    c.execute('''UPDATE brands SET name=?, vertical=?, contact_name=?,
+                               contact_title=?, website=?, instagram=?, linkedin=?, tiktok=?,
+                               budget_tier=?, updated_at=? WHERE id=?''',
+                        (row.get('name'), row.get('vertical'), row.get('contact_name'),
+                         row.get('contact_title'), row.get('website'), row.get('instagram'),
+                         row.get('linkedin'), row.get('tiktok'), row.get('budget_tier'),
+                         now, brand_id))
+                    updated += 1
+                else:
+                    # Insert new
+                    brand_id = str(uuid.uuid4())
+                    c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (brand_id, row.get('name'), row.get('vertical'), row.get('contact_name'),
+                         email, row.get('contact_title'), row.get('website'), row.get('instagram'),
+                         row.get('linkedin'), row.get('tiktok'), row.get('budget_tier'),
+                         'New', None, now, now))
+                    added += 1
+
+            conn.commit()
+            conn.close()
+
+            self._log_activity('brands_uploaded', f"Uploaded {added} new brands, updated {updated}", None, None, None)
+            self._send_json(200, {'added': added, 'updated': updated, 'total': added + updated})
+        except Exception as e:
+            self._send_json(400, {'error': f'Upload failed: {str(e)}'})
 
     # ============ API Handlers - Campaigns ============
 
@@ -1149,11 +1467,26 @@ def send_email(to_email: str, subject: str, body_html: str, from_name: str = "Re
     return True
 
 
+def warmup_server():
+    """Make a request to warm up the server (for Render cold starts)"""
+    try:
+        time.sleep(1)  # Give server time to start
+        req = urllib.request.Request('http://localhost:' + str(PORT) + '/healthz')
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Silently fail if warmup doesn't work
+
+
 def run_server():
     """Start the HTTP server"""
     server_address = ('0.0.0.0', PORT)
     httpd = HTTPServer(server_address, RequestHandler)
     print(f'Server running on port {PORT}')
+
+    # Start warmup in background thread
+    warmup_thread = threading.Thread(target=warmup_server, daemon=True)
+    warmup_thread.start()
+
     httpd.serve_forever()
 
 
