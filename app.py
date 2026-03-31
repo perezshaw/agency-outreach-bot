@@ -36,6 +36,14 @@ SETTINGS_PATH = os.environ.get('SETTINGS_PATH', '/tmp/agency_settings.json')
 BASE_DIR = Path(__file__).parent
 APP_PASSWORD = os.environ.get('APP_PASSWORD', '')  # Empty = no auth required
 
+# Platform API keys (set as environment variables on Render)
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '')
+TWITCH_CLIENT_ID = os.environ.get('TWITCH_CLIENT_ID', '')
+TWITCH_CLIENT_SECRET = os.environ.get('TWITCH_CLIENT_SECRET', '')
+X_BEARER_TOKEN = os.environ.get('X_BEARER_TOKEN', '')
+INSTAGRAM_ACCESS_TOKEN = os.environ.get('INSTAGRAM_ACCESS_TOKEN', '')
+TIKTOK_ACCESS_TOKEN = os.environ.get('TIKTOK_ACCESS_TOKEN', '')
+
 # Session store (in-memory)
 VALID_SESSIONS = set()
 
@@ -422,6 +430,780 @@ SEED_BRANDS = [
     {"name": "Olipop", "vertical": "Food & Beverage", "budget_tier": "$5-25K", "contact_name": "Marcus Green", "contact_email": "partnerships@olipop.com", "contact_title": "Creator Relations Manager", "website": "olipop.com", "instagram": "@olipop", "linkedin": "olipop", "tiktok": "@olipop"}
 ]
 
+# Creator platform handles for API lookups
+CREATOR_HANDLES = {
+    "1": {  # Kalani Rodgers - Comedy
+        "youtube": "KalaniRodgers",
+        "twitch": "kalanirodgers",
+        "kick": "kalanirodgers",
+        "instagram": "kalanirodgers",
+        "tiktok": "kalanirodgers",
+        "x": "kalanirodgers",
+    },
+    "2": {  # Coach Canela - Fitness
+        "youtube": "CoachCanela",
+        "twitch": "coachcanela",
+        "kick": "coachcanela",
+        "instagram": "coachcanela",
+        "tiktok": "coachcanela",
+        "x": "coachcanela",
+    },
+    "3": {  # Kayla Rae Ortiz - Wellness
+        "youtube": "KaylaRaeWellness",
+        "twitch": "kaylaraewellness",
+        "kick": "kaylaraewellness",
+        "instagram": "kaylarae.wellness",
+        "tiktok": "kaylarae.wellness",
+        "x": "kaylaraewellness",
+    },
+}
+
+
+class PlatformAPI:
+    """Unified social media platform data fetcher with SQLite caching.
+
+    Supports: YouTube (Data API v3), Twitch (Helix API), Kick (public API),
+    Instagram (Graph API), X/Twitter (API v2), TikTok (Research API).
+    Falls back to embedded mock data when API keys are not configured.
+    """
+
+    CACHE_TTL_SECONDS = 3600  # Cache results for 1 hour
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._twitch_token: Optional[str] = None
+        self._twitch_token_expires: float = 0.0
+
+    def _get_db(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    def _get_cached(self, creator_id: str, platform: str) -> Optional[Dict]:
+        """Return cached data if still within TTL, else None."""
+        try:
+            conn = self._get_db()
+            c = conn.cursor()
+            c.execute(
+                'SELECT data, fetched_at FROM platform_api_cache '
+                'WHERE creator_id = ? AND platform = ? ORDER BY fetched_at DESC LIMIT 1',
+                (creator_id, platform)
+            )
+            row = c.fetchone()
+            conn.close()
+            if row:
+                data_str, fetched_at_str = row
+                fetched_at = datetime.fromisoformat(fetched_at_str)
+                age = (datetime.utcnow() - fetched_at).total_seconds()
+                if age < self.CACHE_TTL_SECONDS:
+                    return json.loads(data_str)
+        except Exception:
+            pass
+        return None
+
+    def _set_cached(self, creator_id: str, platform: str, data: Dict, source: str = 'api') -> None:
+        """Upsert data into the platform_api_cache table."""
+        try:
+            conn = self._get_db()
+            c = conn.cursor()
+            c.execute('DELETE FROM platform_api_cache WHERE creator_id = ? AND platform = ?',
+                      (creator_id, platform))
+            c.execute(
+                'INSERT INTO platform_api_cache (id, creator_id, platform, data, fetched_at, source) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (str(uuid.uuid4()), creator_id, platform, json.dumps(data),
+                 datetime.utcnow().isoformat(), source)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def _http_get(self, url: str, headers: Optional[Dict] = None, timeout: int = 10) -> Optional[Dict]:
+        """HTTP GET with urllib.request; returns parsed JSON or None on error."""
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'AgencyOutreachBot/1.0')
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception:
+            return None
+
+    def _http_post_form(self, url: str, params: Dict, timeout: int = 10) -> Optional[Dict]:
+        """HTTP POST with form-encoded body; returns parsed JSON or None."""
+        try:
+            from urllib.parse import urlencode
+            data = urlencode(params).encode('utf-8')
+            req = urllib.request.Request(url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+            req.add_header('User-Agent', 'AgencyOutreachBot/1.0')
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception:
+            return None
+
+    # ──────────────────────────────── YouTube ────────────────────────────────
+
+    def fetch_youtube(self, creator_id: str, handle: str) -> Dict:
+        """Fetch YouTube channel stats using Data API v3 (free, 10K units/day)."""
+        cached = self._get_cached(creator_id, 'youtube')
+        if cached:
+            return cached
+
+        if not YOUTUBE_API_KEY:
+            return self._fallback(creator_id, 'youtube')
+
+        clean = handle.lstrip('@')
+        # Try by @handle first (modern channels)
+        data = self._http_get(
+            f'https://www.googleapis.com/youtube/v3/channels'
+            f'?part=statistics,snippet&forHandle={clean}&key={YOUTUBE_API_KEY}'
+        )
+        if not data or not data.get('items'):
+            # Fallback: try legacy username
+            data = self._http_get(
+                f'https://www.googleapis.com/youtube/v3/channels'
+                f'?part=statistics,snippet&forUsername={clean}&key={YOUTUBE_API_KEY}'
+            )
+
+        if data and data.get('items'):
+            ch = data['items'][0]
+            stats = ch.get('statistics', {})
+            snippet = ch.get('snippet', {})
+            channel_id = ch.get('id', '')
+            avg_views = self._youtube_avg_views(channel_id) if channel_id else 0
+            result = {
+                'platform': 'youtube',
+                'followers': int(stats.get('subscriberCount', 0)),
+                'total_views': int(stats.get('viewCount', 0)),
+                'video_count': int(stats.get('videoCount', 0)),
+                'avg_views_30d': avg_views,
+                'channel_name': snippet.get('title', clean),
+                'source': 'api',
+                'fetched_at': datetime.utcnow().isoformat(),
+            }
+            self._set_cached(creator_id, 'youtube', result)
+            return result
+
+        return self._fallback(creator_id, 'youtube')
+
+    def _youtube_avg_views(self, channel_id: str) -> int:
+        """Average views of videos published in the last 30 days (uses ~101 quota units)."""
+        if not YOUTUBE_API_KEY or not channel_id:
+            return 0
+        after = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        search = self._http_get(
+            f'https://www.googleapis.com/youtube/v3/search'
+            f'?part=id&channelId={channel_id}&type=video&order=date'
+            f'&maxResults=10&publishedAfter={after}&key={YOUTUBE_API_KEY}'
+        )
+        if not search or not search.get('items'):
+            return 0
+        ids = [i['id']['videoId'] for i in search['items'] if i.get('id', {}).get('videoId')]
+        if not ids:
+            return 0
+        videos = self._http_get(
+            f'https://www.googleapis.com/youtube/v3/videos'
+            f'?part=statistics&id={",".join(ids)}&key={YOUTUBE_API_KEY}'
+        )
+        if not videos or not videos.get('items'):
+            return 0
+        total = sum(int(v.get('statistics', {}).get('viewCount', 0)) for v in videos['items'])
+        return total // len(videos['items'])
+
+    # ──────────────────────────────── Twitch ─────────────────────────────────
+
+    def _twitch_app_token(self) -> Optional[str]:
+        """Get or refresh Twitch app access token via client credentials flow."""
+        if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+            return None
+        if self._twitch_token and time.time() < self._twitch_token_expires:
+            return self._twitch_token
+        resp = self._http_post_form(
+            'https://id.twitch.tv/oauth2/token',
+            {'client_id': TWITCH_CLIENT_ID,
+             'client_secret': TWITCH_CLIENT_SECRET,
+             'grant_type': 'client_credentials'}
+        )
+        if resp and resp.get('access_token'):
+            self._twitch_token = resp['access_token']
+            self._twitch_token_expires = time.time() + resp.get('expires_in', 3600) - 60
+            return self._twitch_token
+        return None
+
+    def fetch_twitch(self, creator_id: str, username: str) -> Dict:
+        """Fetch Twitch follower count + total views via Helix API (free)."""
+        cached = self._get_cached(creator_id, 'twitch')
+        if cached:
+            return cached
+
+        token = self._twitch_app_token()
+        if not token:
+            return self._fallback(creator_id, 'twitch')
+
+        headers = {'Authorization': f'Bearer {token}', 'Client-Id': TWITCH_CLIENT_ID}
+
+        # Step 1: Get broadcaster_id
+        user_data = self._http_get(
+            f'https://api.twitch.tv/helix/users?login={username}', headers=headers
+        )
+        if not user_data or not user_data.get('data'):
+            return self._fallback(creator_id, 'twitch')
+
+        user = user_data['data'][0]
+        broadcaster_id = user['id']
+
+        # Step 2: Get follower total (app token returns only the count, not list)
+        followers_data = self._http_get(
+            f'https://api.twitch.tv/helix/channels/followers?broadcaster_id={broadcaster_id}',
+            headers=headers
+        )
+        follower_count = followers_data.get('total', 0) if followers_data else 0
+
+        result = {
+            'platform': 'twitch',
+            'followers': follower_count,
+            'total_views': user.get('view_count', 0),
+            'display_name': user.get('display_name', username),
+            'broadcaster_type': user.get('broadcaster_type', ''),
+            'source': 'api',
+            'fetched_at': datetime.utcnow().isoformat(),
+        }
+        self._set_cached(creator_id, 'twitch', result)
+        return result
+
+    # ──────────────────────────────── Kick ───────────────────────────────────
+
+    def fetch_kick(self, creator_id: str, username: str) -> Dict:
+        """Fetch Kick channel stats via public API endpoint."""
+        cached = self._get_cached(creator_id, 'kick')
+        if cached:
+            return cached
+
+        data = self._http_get(
+            f'https://kick.com/api/v2/channels/{username}',
+            headers={'Accept': 'application/json'}
+        )
+        if data and not data.get('error'):
+            result = {
+                'platform': 'kick',
+                'followers': data.get('followersCount', data.get('followers_count', 0)),
+                'total_views': data.get('viewersCount', data.get('viewers_count', 0)),
+                'is_live': data.get('livestream') is not None,
+                'username': data.get('slug', username),
+                'source': 'api',
+                'fetched_at': datetime.utcnow().isoformat(),
+            }
+            self._set_cached(creator_id, 'kick', result)
+            return result
+
+        return self._fallback(creator_id, 'kick')
+
+    # ──────────────────────────────── Instagram ───────────────────────────────
+
+    def fetch_instagram(self, creator_id: str, username: str) -> Dict:
+        """Fetch Instagram stats via Graph API (requires INSTAGRAM_ACCESS_TOKEN)."""
+        cached = self._get_cached(creator_id, 'instagram')
+        if cached:
+            return cached
+
+        if not INSTAGRAM_ACCESS_TOKEN:
+            return self._fallback(creator_id, 'instagram')
+
+        data = self._http_get(
+            f'https://graph.instagram.com/me'
+            f'?fields=followers_count,media_count,username'
+            f'&access_token={INSTAGRAM_ACCESS_TOKEN}'
+        )
+        if data and not data.get('error'):
+            result = {
+                'platform': 'instagram',
+                'followers': data.get('followers_count', 0),
+                'post_count': data.get('media_count', 0),
+                'username': data.get('username', username),
+                'source': 'api',
+                'fetched_at': datetime.utcnow().isoformat(),
+            }
+            self._set_cached(creator_id, 'instagram', result)
+            return result
+
+        return self._fallback(creator_id, 'instagram')
+
+    # ──────────────────────────────── X (Twitter) ────────────────────────────
+
+    def fetch_x(self, creator_id: str, username: str) -> Dict:
+        """Fetch X public metrics via API v2 (requires X_BEARER_TOKEN, Basic tier)."""
+        cached = self._get_cached(creator_id, 'x')
+        if cached:
+            return cached
+
+        if not X_BEARER_TOKEN:
+            return self._fallback(creator_id, 'x')
+
+        clean = username.lstrip('@')
+        data = self._http_get(
+            f'https://api.twitter.com/2/users/by/username/{clean}?user.fields=public_metrics',
+            headers={'Authorization': f'Bearer {X_BEARER_TOKEN}'}
+        )
+        if data and data.get('data'):
+            metrics = data['data'].get('public_metrics', {})
+            result = {
+                'platform': 'x',
+                'followers': metrics.get('followers_count', 0),
+                'following': metrics.get('following_count', 0),
+                'tweet_count': metrics.get('tweet_count', 0),
+                'username': clean,
+                'source': 'api',
+                'fetched_at': datetime.utcnow().isoformat(),
+            }
+            self._set_cached(creator_id, 'x', result)
+            return result
+
+        return self._fallback(creator_id, 'x')
+
+    # ──────────────────────────────── TikTok ─────────────────────────────────
+
+    def fetch_tiktok(self, creator_id: str, username: str) -> Dict:
+        """Fetch TikTok stats (requires TIKTOK_ACCESS_TOKEN from Research API approval)."""
+        cached = self._get_cached(creator_id, 'tiktok')
+        if cached:
+            return cached
+        # TikTok Research API requires application approval at developers.tiktok.com
+        # Falls back to mock data until TIKTOK_ACCESS_TOKEN is configured
+        return self._fallback(creator_id, 'tiktok')
+
+    # ──────────────────────────────── Fallback ───────────────────────────────
+
+    def _fallback(self, creator_id: str, platform: str) -> Dict:
+        """Return embedded mock stats from the CREATORS dict."""
+        creator = CREATORS.get(creator_id, {})
+        pdata = creator.get('platforms', {}).get(platform, {})
+        result = {
+            'platform': platform,
+            'followers': pdata.get('followers', 0),
+            'engagement_rate': pdata.get('engagement_rate', 0),
+            'source': 'mock',
+            'fetched_at': datetime.utcnow().isoformat(),
+        }
+        self._set_cached(creator_id, platform, result, source='mock')
+        return result
+
+    # ──────────────────────────────── Aggregate ──────────────────────────────
+
+    def fetch_all(self, creator_id: str, force: bool = False) -> Dict:
+        """Fetch stats for every platform for a creator.
+
+        Args:
+            creator_id: Creator ID string ("1", "2", or "3")
+            force: If True, clear cached data and fetch fresh
+        Returns:
+            Dict mapping platform name -> stats dict
+        """
+        creator = CREATORS.get(creator_id, {})
+        creator_platforms = set(creator.get('platforms', {}).keys())
+        handles = CREATOR_HANDLES.get(creator_id, {})
+
+        fetch_map = {
+            'youtube': self.fetch_youtube,
+            'twitch': self.fetch_twitch,
+            'kick': self.fetch_kick,
+            'tiktok': self.fetch_tiktok,
+            'instagram': self.fetch_instagram,
+            'x': self.fetch_x,
+        }
+
+        results = {}
+        for platform, fetch_fn in fetch_map.items():
+            handle = handles.get(platform, '')
+            # Only fetch platforms the creator is on (plus Twitch/Kick as bonus)
+            if platform not in creator_platforms and platform not in ('twitch', 'kick'):
+                continue
+            if force:
+                try:
+                    conn = self._get_db()
+                    c = conn.cursor()
+                    c.execute(
+                        'DELETE FROM platform_api_cache WHERE creator_id = ? AND platform = ?',
+                        (creator_id, platform)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                results[platform] = fetch_fn(creator_id, handle)
+            except Exception:
+                results[platform] = self._fallback(creator_id, platform)
+
+        return results
+
+    def generate_rate_card(self, creator_id: str) -> Dict:
+        """Generate a rate card with pricing tiers derived from real platform metrics."""
+        creator = CREATORS.get(creator_id)
+        if not creator:
+            return {'error': 'Creator not found'}
+
+        all_stats = self.fetch_all(creator_id)
+
+        # Aggregate follower count across all platforms
+        total_followers = sum(s.get('followers', 0) for s in all_stats.values())
+
+        # Weighted average engagement rate
+        eng_rates = []
+        for platform, s in all_stats.items():
+            followers = s.get('followers', 0)
+            rate = s.get('engagement_rate') or creator['platforms'].get(platform, {}).get('engagement_rate', 0)
+            if followers > 0 and rate > 0:
+                eng_rates.append(rate)
+        avg_engagement = round(sum(eng_rates) / len(eng_rates), 2) if eng_rates else creator.get('avg_engagement_rate', 5.0)
+
+        def calc_price(followers: int, eng_rate: float, content_type: str) -> int:
+            """CPM-based pricing with engagement multiplier."""
+            base_cpm = 15.0  # $15 per 1,000 followers baseline
+            eng_mult = 1.0 + (eng_rate / 10.0)
+            base = (followers / 1000.0) * base_cpm * eng_mult
+            mults = {
+                'story': 0.25, 'post': 1.0, 'reel': 1.3,
+                'video': 2.0, 'series': 4.5, 'campaign': 9.0,
+            }
+            return max(500, int(base * mults.get(content_type, 1.0)))
+
+        platform_rates = {}
+        for platform, stats in all_stats.items():
+            followers = stats.get('followers', 0)
+            if followers <= 0:
+                continue
+            eng = stats.get('engagement_rate') or creator['platforms'].get(platform, {}).get('engagement_rate', 5.0)
+            platform_rates[platform] = {
+                'followers': followers,
+                'engagement_rate': eng,
+                'source': stats.get('source', 'mock'),
+                'rates': {
+                    'story': f'${calc_price(followers, eng, "story"):,}',
+                    'post': f'${calc_price(followers, eng, "post"):,}',
+                    'reel_or_video': f'${calc_price(followers, eng, "reel"):,}',
+                    'series_3_videos': f'${calc_price(followers, eng, "series"):,}',
+                    'full_campaign': f'${calc_price(followers, eng, "campaign"):,}',
+                },
+            }
+
+        # Determine overall pricing tier
+        if total_followers >= 5_000_000:
+            tier = '$100K+'
+        elif total_followers >= 1_000_000:
+            tier = '$25-100K'
+        elif total_followers >= 500_000:
+            tier = '$10-25K'
+        elif total_followers >= 100_000:
+            tier = '$5-10K'
+        else:
+            tier = '$1-5K'
+
+        return {
+            'creator_id': creator_id,
+            'creator_name': creator['name'],
+            'niche': creator.get('niche', ''),
+            'total_reach': total_followers,
+            'avg_engagement_rate': avg_engagement,
+            'pricing_tier': tier,
+            'audience': creator.get('audience', ''),
+            'verticals': creator.get('verticals', []),
+            'platform_rates': platform_rates,
+            'data_sources': {p: s.get('source', 'mock') for p, s in all_stats.items()},
+            'generated_at': datetime.utcnow().isoformat(),
+        }
+
+
+# Global PlatformAPI instance (initialized after DB path is known)
+_platform_api: Optional['PlatformAPI'] = None
+
+
+def get_platform_api() -> 'PlatformAPI':
+    global _platform_api
+    if _platform_api is None:
+        _platform_api = PlatformAPI(DB_PATH)
+    return _platform_api
+
+
+# ───────────────────────────────── Twitch API & Ingestion ───────────────────────────────────
+
+class TwitchAPI:
+    """Twitch Helix API client for ingesting and searching top streamers.
+    Uses only urllib.request (no external dependencies).
+    """
+
+    def __init__(self, client_id: str, client_secret: str):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.access_token: Optional[str] = None
+        self.token_expires_at: float = 0.0
+
+    def _http_post(self, url: str, params: Dict, headers: Optional[Dict] = None, timeout: int = 10) -> Optional[Dict]:
+        """HTTP POST with form-encoded body; returns parsed JSON or None."""
+        try:
+            from urllib.parse import urlencode
+            data = urlencode(params).encode('utf-8')
+            req = urllib.request.Request(url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+            req.add_header('User-Agent', 'AgencyOutreachBot/1.0')
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            print(f'Twitch POST error ({url}): {e}', file=__import__('sys').stderr)
+            return None
+
+    def _http_get(self, url: str, headers: Optional[Dict] = None, timeout: int = 10) -> Optional[Dict]:
+        """HTTP GET with urllib.request; returns parsed JSON or None on error."""
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'AgencyOutreachBot/1.0')
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            print(f'Twitch GET error ({url}): {e}', file=__import__('sys').stderr)
+            return None
+
+    def get_app_token(self) -> Optional[str]:
+        """Get Twitch application access token using client credentials flow.
+        Token is cached and reused for ~60 days.
+        """
+        now = time.time()
+        if self.access_token and now < self.token_expires_at:
+            return self.access_token
+
+        url = 'https://id.twitch.tv/oauth2/token'
+        params = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'client_credentials'
+        }
+        resp = self._http_post(url, params)
+        if not resp or 'access_token' not in resp:
+            return None
+
+        self.access_token = resp['access_token']
+        expires_in = resp.get('expires_in', 3600)
+        self.token_expires_at = now + expires_in - 300  # Refresh 5 min before expiry
+        print(f'Twitch token acquired (expires in {expires_in}s)', file=__import__('sys').stderr)
+        return self.access_token
+
+    def get_top_streams(self, count: int = 1000) -> List[Dict]:
+        """Paginate through top live streams.
+        Returns list of stream objects with user_id, user_login, user_name, game_name, viewer_count, etc.
+        """
+        token = self.get_app_token()
+        if not token:
+            return []
+
+        headers = {
+            'Client-ID': self.client_id,
+            'Authorization': f'Bearer {token}'
+        }
+
+        streams = []
+        cursor = None
+
+        while len(streams) < count:
+            url = f'https://api.twitch.tv/helix/streams?first=100'
+            if cursor:
+                url += f'&after={cursor}'
+
+            resp = self._http_get(url, headers)
+            if not resp or 'data' not in resp:
+                break
+
+            data = resp['data']
+            if not data:
+                break
+
+            streams.extend(data)
+
+            # Check for pagination
+            pagination = resp.get('pagination', {})
+            cursor = pagination.get('cursor')
+            if not cursor:
+                break
+
+            time.sleep(0.1)  # Rate limiting
+
+        return streams[:count]
+
+    def get_users(self, user_ids: List[str]) -> List[Dict]:
+        """Batch lookup users by IDs (max 100 per request).
+        Returns list of user objects with id, login, display_name, description, profile_image_url, created_at, broadcaster_type.
+        """
+        token = self.get_app_token()
+        if not token or not user_ids:
+            return []
+
+        headers = {
+            'Client-ID': self.client_id,
+            'Authorization': f'Bearer {token}'
+        }
+
+        users = []
+        for i in range(0, len(user_ids), 100):
+            batch = user_ids[i:i+100]
+            params = '&'.join([f'id={uid}' for uid in batch])
+            url = f'https://api.twitch.tv/helix/users?{params}'
+
+            resp = self._http_get(url, headers)
+            if resp and 'data' in resp:
+                users.extend(resp['data'])
+
+            time.sleep(0.1)
+
+        return users
+
+    def get_follower_count(self, broadcaster_id: str) -> int:
+        """Get follower count for a broadcaster.
+        Requires app access token (no user scope needed).
+        Returns the 'total' field.
+        """
+        token = self.get_app_token()
+        if not token:
+            return 0
+
+        headers = {
+            'Client-ID': self.client_id,
+            'Authorization': f'Bearer {token}'
+        }
+
+        url = f'https://api.twitch.tv/helix/channels/followers?broadcaster_id={broadcaster_id}&first=1'
+        resp = self._http_get(url, headers)
+
+        if resp and 'total' in resp:
+            return resp['total']
+
+        return 0
+
+    def search_channels(self, query: str, first: int = 20) -> List[Dict]:
+        """Search for channels by query string.
+        Returns matching channel objects.
+        """
+        token = self.get_app_token()
+        if not token:
+            return []
+
+        headers = {
+            'Client-ID': self.client_id,
+            'Authorization': f'Bearer {token}'
+        }
+
+        from urllib.parse import quote
+        encoded_query = quote(query)
+        url = f'https://api.twitch.tv/helix/search/channels?query={encoded_query}&first={first}'
+        resp = self._http_get(url, headers)
+
+        if resp and 'data' in resp:
+            return resp['data']
+
+        return []
+
+    def ingest_top_streamers(self, count: int = 2000) -> Dict:
+        """Main ingestion method: fetch top streams, get user details, follower counts.
+        Store everything in SQLite twitch_creators table.
+        Returns dict with ingestion stats.
+        """
+        print(f'Starting Twitch ingestion (target: {count} creators)', file=__import__('sys').stderr)
+
+        # Get top streams
+        streams = self.get_top_streams(count)
+        print(f'Fetched {len(streams)} top streams', file=__import__('sys').stderr)
+
+        if not streams:
+            return {'total_creators': 0, 'errors': 1, 'message': 'Failed to fetch streams'}
+
+        # Extract user IDs and map stream data
+        user_ids = [s['user_id'] for s in streams]
+        stream_map = {s['user_id']: s for s in streams}
+
+        # Get user details (batch)
+        users = self.get_users(user_ids)
+        print(f'Fetched details for {len(users)} users', file=__import__('sys').stderr)
+
+        # Get follower counts (with rate limiting)
+        user_map = {u['id']: u for u in users}
+        followers_map = {}
+        errors = 0
+
+        for i, user in enumerate(users):
+            if i % 100 == 0 and i > 0:
+                print(f'  Fetching follower counts... {i}/{len(users)}', file=__import__('sys').stderr)
+
+            followers = self.get_follower_count(user['id'])
+            followers_map[user['id']] = followers
+            time.sleep(0.1)  # Rate limiting (Twitch allows 800/min for app tokens)
+
+        # Store in database
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now = datetime.utcnow().isoformat()
+        ingested = 0
+
+        for user in users:
+            try:
+                user_id = user['id']
+                stream = stream_map.get(user_id)
+                followers = followers_map.get(user_id, 0)
+
+                creator_id = f'twitch_{user_id}'
+
+                c.execute('''INSERT OR REPLACE INTO twitch_creators (
+                    id, twitch_id, login, display_name, description, profile_image_url,
+                    broadcaster_type, followers, current_viewers, is_live, game_name,
+                    stream_title, language, last_seen_live, created_at, updated_at,
+                    ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    creator_id,
+                    user_id,
+                    user.get('login', ''),
+                    user.get('display_name', ''),
+                    user.get('description', ''),
+                    user.get('profile_image_url', ''),
+                    user.get('broadcaster_type', ''),
+                    followers,
+                    stream.get('viewer_count', 0) if stream else 0,
+                    1 if stream else 0,
+                    stream.get('game_name', '') if stream else '',
+                    stream.get('title', '') if stream else '',
+                    stream.get('language', '') if stream else '',
+                    stream.get('started_at', '') if stream else None,
+                    user.get('created_at', now),
+                    now,
+                    now
+                ))
+                ingested += 1
+            except Exception as e:
+                print(f'Error ingesting user {user.get("login")}: {e}', file=__import__('sys').stderr)
+                errors += 1
+
+        conn.commit()
+        conn.close()
+
+        print(f'Ingestion complete: {ingested} creators stored ({errors} errors)', file=__import__('sys').stderr)
+        return {'total_creators': ingested, 'errors': errors}
+
+
+# Global ingestion status
+_twitch_ingestion_status = {
+    'status': 'idle',  # idle, running, complete
+    'ingested': 0,
+    'target': 0,
+    'errors': 0,
+    'started_at': None,
+    'completed_at': None
+}
+_twitch_ingestion_lock = threading.Lock()
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler for Agency Outreach Bot API"""
@@ -492,6 +1274,28 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_get_daily_stats(params)
             elif path == '/api/stats/summary':
                 self._handle_get_stats_summary(params)
+            elif path == '/api/stats/refresh':
+                force = params.get('force', 'false').lower() == 'true'
+                self._handle_stats_refresh(force)
+            elif path.startswith('/api/stats/live/'):
+                creator_id = path.split('/')[-1]
+                self._handle_stats_live(creator_id)
+            elif path.startswith('/api/ratecard/'):
+                creator_id = path.split('/')[-1]
+                self._handle_ratecard(creator_id)
+            elif path == '/api/platform_status':
+                self._handle_platform_status()
+            elif path == '/api/twitch/ingest':
+                self._handle_twitch_ingest(params)
+            elif path == '/api/twitch/ingest/status':
+                self._handle_twitch_ingest_status()
+            elif path == '/api/twitch/search':
+                self._handle_twitch_search(params)
+            elif path == '/api/twitch/stats':
+                self._handle_twitch_stats()
+            elif path.startswith('/api/twitch/creator/'):
+                twitch_id = path.split('/')[-1]
+                self._handle_twitch_creator(twitch_id)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -937,6 +1741,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             created_at TEXT
         )''')
 
+        # Platform API cache table (stores fetched API responses for 1 hour)
+        c.execute('''CREATE TABLE IF NOT EXISTS platform_api_cache (
+            id TEXT PRIMARY KEY,
+            creator_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            data TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            source TEXT DEFAULT 'api'
+        )''')
+
         # Create shortlist table
         c.execute('''CREATE TABLE IF NOT EXISTS shortlist (
             id TEXT PRIMARY KEY,
@@ -951,6 +1765,31 @@ class RequestHandler(BaseHTTPRequestHandler):
             recent_growth REAL,
             match_score INTEGER,
             added_at TEXT
+        )''')
+
+        # Twitch creators table (ingested from Twitch API)
+        c.execute('''CREATE TABLE IF NOT EXISTS twitch_creators (
+            id TEXT PRIMARY KEY,
+            twitch_id TEXT UNIQUE,
+            login TEXT,
+            display_name TEXT,
+            description TEXT,
+            profile_image_url TEXT,
+            broadcaster_type TEXT,
+            followers INTEGER DEFAULT 0,
+            total_views INTEGER DEFAULT 0,
+            current_viewers INTEGER DEFAULT 0,
+            is_live INTEGER DEFAULT 0,
+            game_name TEXT,
+            stream_title TEXT,
+            language TEXT,
+            avg_viewers INTEGER DEFAULT 0,
+            peak_viewers INTEGER DEFAULT 0,
+            hours_streamed REAL DEFAULT 0,
+            last_seen_live TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            ingested_at TEXT
         )''')
 
         conn.commit()
@@ -1944,6 +2783,329 @@ class RequestHandler(BaseHTTPRequestHandler):
         conn.close()
 
         self._send_json(200, summary)
+
+    # ============ Platform API Handlers ============
+
+    def _handle_stats_refresh(self, force: bool = False):
+        """GET /api/stats/refresh — Trigger fresh pull from all platform APIs."""
+        self._init_db()
+        api = get_platform_api()
+        results = {}
+        errors = {}
+        for creator_id in CREATORS:
+            try:
+                stats = api.fetch_all(creator_id, force=force)
+                results[creator_id] = {
+                    'creator_name': CREATORS[creator_id]['name'],
+                    'platforms_fetched': list(stats.keys()),
+                    'sources': {p: s.get('source', 'unknown') for p, s in stats.items()},
+                }
+                # Write latest stats snapshot to daily_stats table
+                today = datetime.utcnow().strftime('%Y-%m-%d')
+                conn = self._get_db()
+                c = conn.cursor()
+                for platform, s in stats.items():
+                    stat_id = str(uuid.uuid4())
+                    now = datetime.utcnow().isoformat()
+                    followers = s.get('followers', 0)
+                    views = s.get('total_views', s.get('views', 0))
+                    engagement = int(followers * (s.get('engagement_rate', 0) / 100)) if s.get('engagement_rate') else 0
+                    c.execute(
+                        'INSERT OR REPLACE INTO daily_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (stat_id, creator_id, platform, today,
+                         followers, views, engagement, 0, 0, 0, now)
+                    )
+                conn.commit()
+                conn.close()
+            except Exception as ex:
+                errors[creator_id] = str(ex)
+
+        self._send_json(200, {
+            'refreshed': True,
+            'forced': force,
+            'results': results,
+            'errors': errors,
+            'timestamp': datetime.utcnow().isoformat(),
+        })
+
+    def _handle_stats_live(self, creator_id: str):
+        """GET /api/stats/live/<creator_id> — Latest cached stats for one creator."""
+        self._init_db()
+        if creator_id not in CREATORS:
+            self._send_json(404, {'error': 'Creator not found'})
+            return
+        api = get_platform_api()
+        all_stats = api.fetch_all(creator_id)
+
+        total_followers = sum(s.get('followers', 0) for s in all_stats.values())
+        eng_rates = [
+            s.get('engagement_rate') or CREATORS[creator_id]['platforms'].get(p, {}).get('engagement_rate', 0)
+            for p, s in all_stats.items()
+            if s.get('followers', 0) > 0
+        ]
+        avg_engagement = round(sum(eng_rates) / len(eng_rates), 2) if eng_rates else 0
+
+        self._send_json(200, {
+            'creator_id': creator_id,
+            'creator_name': CREATORS[creator_id]['name'],
+            'total_followers': total_followers,
+            'avg_engagement_rate': avg_engagement,
+            'platforms': all_stats,
+            'fetched_at': datetime.utcnow().isoformat(),
+        })
+
+    def _handle_ratecard(self, creator_id: str):
+        """GET /api/ratecard/<creator_id> — Generate rate card from real metrics."""
+        self._init_db()
+        if creator_id not in CREATORS:
+            self._send_json(404, {'error': 'Creator not found'})
+            return
+        api = get_platform_api()
+        rate_card = api.generate_rate_card(creator_id)
+        self._send_json(200, rate_card)
+
+    def _handle_platform_status(self):
+        """GET /api/platform_status — Show which API keys are configured."""
+        self._send_json(200, {
+            'youtube': {
+                'configured': bool(YOUTUBE_API_KEY),
+                'note': 'Set YOUTUBE_API_KEY env var (Google Cloud Console)',
+                'free_tier': '10,000 units/day',
+            },
+            'twitch': {
+                'configured': bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET),
+                'note': 'Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET (dev.twitch.tv)',
+                'free_tier': 'Free with client credentials',
+            },
+            'kick': {
+                'configured': True,
+                'note': 'Uses public API endpoint — no key required',
+                'free_tier': 'Public (no auth needed)',
+            },
+            'instagram': {
+                'configured': bool(INSTAGRAM_ACCESS_TOKEN),
+                'note': 'Set INSTAGRAM_ACCESS_TOKEN (Meta Developer App + Business Account)',
+                'free_tier': 'Free with Meta Developer account',
+            },
+            'x': {
+                'configured': bool(X_BEARER_TOKEN),
+                'note': 'Set X_BEARER_TOKEN — requires X API Basic tier ($100/mo)',
+                'free_tier': 'Basic tier required for read access',
+            },
+            'tiktok': {
+                'configured': bool(TIKTOK_ACCESS_TOKEN),
+                'note': 'Set TIKTOK_ACCESS_TOKEN — requires Research API approval at developers.tiktok.com',
+                'free_tier': 'Free but requires application approval',
+            },
+        })
+
+    # ============ Twitch Ingestion & Search ============
+
+    def _handle_twitch_ingest(self, params: Dict[str, str]):
+        """GET /api/twitch/ingest — Trigger full ingestion of top Twitch streamers.
+        Uses threading so it doesn't block. Returns immediately with status.
+        """
+        if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+            self._send_json(400, {'error': 'Twitch API credentials not configured'})
+            return
+
+        target_count = int(params.get('count', '2000'))
+
+        # Check if already running
+        with _twitch_ingestion_lock:
+            if _twitch_ingestion_status['status'] == 'running':
+                self._send_json(200, {
+                    'status': 'already_running',
+                    'message': 'Ingestion already in progress',
+                    'started_at': _twitch_ingestion_status['started_at']
+                })
+                return
+
+            # Mark as running
+            _twitch_ingestion_status['status'] = 'running'
+            _twitch_ingestion_status['target'] = target_count
+            _twitch_ingestion_status['ingested'] = 0
+            _twitch_ingestion_status['errors'] = 0
+            _twitch_ingestion_status['started_at'] = datetime.utcnow().isoformat()
+            _twitch_ingestion_status['completed_at'] = None
+
+        # Start ingestion in background thread
+        def _ingest_thread():
+            try:
+                twitch_api = TwitchAPI(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
+                result = twitch_api.ingest_top_streamers(target_count)
+                with _twitch_ingestion_lock:
+                    _twitch_ingestion_status['status'] = 'complete'
+                    _twitch_ingestion_status['ingested'] = result.get('total_creators', 0)
+                    _twitch_ingestion_status['errors'] = result.get('errors', 0)
+                    _twitch_ingestion_status['completed_at'] = datetime.utcnow().isoformat()
+            except Exception as e:
+                print(f'Twitch ingestion error: {e}', file=__import__('sys').stderr)
+                with _twitch_ingestion_lock:
+                    _twitch_ingestion_status['status'] = 'error'
+                    _twitch_ingestion_status['errors'] += 1
+                    _twitch_ingestion_status['completed_at'] = datetime.utcnow().isoformat()
+
+        thread = threading.Thread(target=_ingest_thread, daemon=True)
+        thread.start()
+
+        self._send_json(200, {
+            'status': 'ingestion_started',
+            'target_count': target_count,
+            'started_at': _twitch_ingestion_status['started_at']
+        })
+
+    def _handle_twitch_ingest_status(self):
+        """GET /api/twitch/ingest/status — Check ingestion progress."""
+        with _twitch_ingestion_lock:
+            self._send_json(200, {
+                'status': _twitch_ingestion_status['status'],
+                'ingested': _twitch_ingestion_status['ingested'],
+                'target': _twitch_ingestion_status['target'],
+                'errors': _twitch_ingestion_status['errors'],
+                'started_at': _twitch_ingestion_status['started_at'],
+                'completed_at': _twitch_ingestion_status['completed_at']
+            })
+
+    def _handle_twitch_search(self, params: Dict[str, str]):
+        """GET /api/twitch/search — Search local database of ingested Twitch creators.
+        Query params: q, min_followers, max_followers, min_viewers, game, language,
+        sort_by (followers/viewers/avg_viewers), order (asc/desc), page, per_page.
+        """
+        query = params.get('q', '').strip()
+        min_followers = int(params.get('min_followers', '0'))
+        max_followers = int(params.get('max_followers', '999999999'))
+        min_viewers = int(params.get('min_viewers', '0'))
+        game = params.get('game', '').strip()
+        language = params.get('language', '').strip()
+        sort_by = params.get('sort_by', 'followers')  # followers, viewers, avg_viewers
+        order = params.get('order', 'desc').upper()  # ASC or DESC
+        page = int(params.get('page', '1'))
+        per_page = int(params.get('per_page', '50'))
+
+        if order not in ('ASC', 'DESC'):
+            order = 'DESC'
+
+        if sort_by not in ('followers', 'current_viewers', 'avg_viewers'):
+            sort_by = 'followers'
+
+        # Build WHERE clause
+        where_parts = ['1=1']
+        params_list = []
+
+        if query:
+            where_parts.append('(display_name LIKE ? OR login LIKE ?)')
+            q_pattern = f'%{query}%'
+            params_list.extend([q_pattern, q_pattern])
+
+        if min_followers > 0:
+            where_parts.append('followers >= ?')
+            params_list.append(min_followers)
+
+        if max_followers < 999999999:
+            where_parts.append('followers <= ?')
+            params_list.append(max_followers)
+
+        if min_viewers > 0:
+            where_parts.append('current_viewers >= ?')
+            params_list.append(min_viewers)
+
+        if game:
+            where_parts.append('game_name LIKE ?')
+            params_list.append(f'%{game}%')
+
+        if language:
+            where_parts.append('language = ?')
+            params_list.append(language)
+
+        where_clause = ' AND '.join(where_parts)
+
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        # Get total count
+        c.execute(f'SELECT COUNT(*) FROM twitch_creators WHERE {where_clause}', params_list)
+        total = c.fetchone()[0]
+
+        # Get paginated results
+        offset = (page - 1) * per_page
+        query_sql = f'''SELECT * FROM twitch_creators
+                        WHERE {where_clause}
+                        ORDER BY {sort_by} {order}
+                        LIMIT ? OFFSET ?'''
+        params_list.extend([per_page, offset])
+
+        c.execute(query_sql, params_list)
+        rows = c.fetchall()
+        cols = [desc[0] for desc in c.description]
+        results = [dict(zip(cols, row)) for row in rows]
+
+        conn.close()
+
+        self._send_json(200, {
+            'results': results,
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+            'total_pages': (total + per_page - 1) // per_page
+        })
+
+    def _handle_twitch_stats(self):
+        """GET /api/twitch/stats — Summary stats for ingested Twitch creators."""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        # Total creators ingested
+        c.execute('SELECT COUNT(*) FROM twitch_creators')
+        total_creators = c.fetchone()[0]
+
+        # Average followers
+        c.execute('SELECT AVG(followers) FROM twitch_creators')
+        avg_followers = c.fetchone()[0] or 0
+
+        # Top games (by streamer count)
+        c.execute('''SELECT game_name, COUNT(*) as count FROM twitch_creators
+                     WHERE game_name != '' AND game_name IS NOT NULL
+                     GROUP BY game_name ORDER BY count DESC LIMIT 10''')
+        top_games = [{'game': row[0], 'count': row[1]} for row in c.fetchall()]
+
+        # Total live streamers
+        c.execute('SELECT COUNT(*) FROM twitch_creators WHERE is_live = 1')
+        total_live = c.fetchone()[0]
+
+        # Last ingestion time
+        c.execute('SELECT MAX(ingested_at) FROM twitch_creators')
+        last_ingestion = c.fetchone()[0]
+
+        conn.close()
+
+        self._send_json(200, {
+            'total_creators_ingested': total_creators,
+            'avg_followers': int(avg_followers),
+            'top_games': top_games,
+            'total_live': total_live,
+            'last_ingestion_time': last_ingestion
+        })
+
+    def _handle_twitch_creator(self, twitch_id: str):
+        """GET /api/twitch/creator/<twitch_id> — Get full details for a specific creator."""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT * FROM twitch_creators WHERE twitch_id = ?', (twitch_id,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row:
+            self._send_json(404, {'error': 'Creator not found'})
+            return
+
+        cols = [desc[0] for desc in c.description]
+        creator = dict(zip(cols, row))
+        self._send_json(200, creator)
 
     # ============ Helper Methods ============
 
