@@ -486,6 +486,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_activity_feed(limit)
             elif path == '/api/settings':
                 self._handle_get_settings()
+            elif path == '/api/scout/search':
+                self._handle_scout_search(params)
+            elif path == '/api/stats/daily':
+                self._handle_get_daily_stats(params)
+            elif path == '/api/stats/summary':
+                self._handle_get_stats_summary(params)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -528,6 +534,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_log_outreach(data)
             elif path == '/api/settings':
                 self._handle_save_settings(data)
+            elif path == '/api/creators':
+                self._handle_create_creator(data)
+            elif path == '/api/scout/shortlist':
+                self._handle_shortlist_creator(data)
+            elif path == '/api/stats/daily':
+                self._handle_record_daily_stats(data)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -553,6 +565,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path.startswith('/api/campaigns/'):
                 campaign_id = path.split('/')[-1]
                 self._handle_update_campaign(campaign_id, data)
+            elif path.startswith('/api/creators/'):
+                creator_id = path.split('/')[-1]
+                self._handle_update_creator(creator_id, data)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -571,6 +586,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path.startswith('/api/brands/'):
                 brand_id = path.split('/')[-1]
                 self._handle_delete_brand(brand_id)
+            elif path.startswith('/api/creators/'):
+                creator_id = path.split('/')[-1]
+                self._handle_delete_creator(creator_id)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -884,6 +902,57 @@ class RequestHandler(BaseHTTPRequestHandler):
             created_at TEXT
         )''')
 
+        # Create creators table
+        c.execute('''CREATE TABLE IF NOT EXISTS creators (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            niche TEXT,
+            bio TEXT,
+            platforms TEXT,
+            services TEXT,
+            pricing_tier TEXT,
+            audience TEXT,
+            contact_email TEXT,
+            contact_phone TEXT,
+            rate_card_url TEXT,
+            verticals TEXT,
+            brand_partnerships TEXT,
+            recent_posts TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )''')
+
+        # Create daily_stats table
+        c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (
+            id TEXT PRIMARY KEY,
+            creator_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            date TEXT NOT NULL,
+            followers INTEGER,
+            views INTEGER,
+            engagement INTEGER,
+            new_followers INTEGER,
+            watch_hours INTEGER,
+            peak_viewers INTEGER,
+            created_at TEXT
+        )''')
+
+        # Create shortlist table
+        c.execute('''CREATE TABLE IF NOT EXISTS shortlist (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            handle TEXT,
+            platform TEXT,
+            followers INTEGER,
+            engagement_rate REAL,
+            niche TEXT,
+            avatar_placeholder TEXT,
+            bio TEXT,
+            recent_growth REAL,
+            match_score INTEGER,
+            added_at TEXT
+        )''')
+
         conn.commit()
 
         # Seed brands if table is empty
@@ -899,7 +968,93 @@ class RequestHandler(BaseHTTPRequestHandler):
                      brand['budget_tier'], 'New', None, now, now))
             conn.commit()
 
+        # Seed creators if table is empty
+        c.execute('SELECT COUNT(*) FROM creators')
+        if c.fetchone()[0] == 0:
+            for creator_id, creator in CREATORS.items():
+                now = datetime.utcnow().isoformat()
+                c.execute('''INSERT INTO creators VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (creator['id'], creator['name'], creator['niche'], creator['bio'],
+                     json.dumps(creator['platforms']), json.dumps(creator['services']),
+                     creator['pricing_tier'], creator['audience'], creator['contact_email'],
+                     creator['contact_phone'], creator['rate_card_url'],
+                     json.dumps(creator['verticals']), json.dumps(creator.get('brand_partnerships', [])),
+                     json.dumps(creator.get('recent_posts', [])), now, now))
+            conn.commit()
+
+        # Seed daily_stats if table is empty
+        c.execute('SELECT COUNT(*) FROM daily_stats')
+        if c.fetchone()[0] == 0:
+            self._seed_daily_stats(conn)
+
         conn.close()
+
+    def _seed_daily_stats(self, conn: sqlite3.Connection):
+        """Seed daily_stats with 30 days of realistic mock data for all 3 creators"""
+        c = conn.cursor()
+        now = datetime.utcnow()
+
+        # Creator stats definitions: (creator_id, creator_name, platform_data)
+        # platform_data: {platform: (base_followers, base_views, base_engagement, base_watch_hours)}
+        creator_stats = {
+            "1": {  # Kalani Rodgers - Comedy
+                "name": "Kalani Rodgers",
+                "platforms": {
+                    "tiktok": (2400000, 450000, 32000, 0),
+                    "instagram": (1200000, 120000, 8900, 0),
+                    "youtube": (800000, 85000, 5200, 80),
+                    "twitter": (250000, 15000, 800, 0),
+                    "twitch": (150000, 25000, 3000, 120),
+                    "kick": (80000, 12000, 1500, 95),
+                }
+            },
+            "2": {  # Coach Canela - Fitness
+                "name": "Coach Canela",
+                "platforms": {
+                    "tiktok": (720000, 250000, 25000, 0),
+                    "instagram": (580000, 180000, 16500, 0),
+                    "youtube": (420000, 95000, 8200, 160),
+                    "twitter": (180000, 10000, 600, 0),
+                    "twitch": (220000, 35000, 3800, 200),
+                    "kick": (140000, 18000, 2200, 145),
+                }
+            },
+            "3": {  # Kayla Rae Ortiz - Wellness
+                "name": "Kayla Rae Ortiz",
+                "platforms": {
+                    "tiktok": (580000, 280000, 31500, 0),
+                    "instagram": (420000, 140000, 13700, 0),
+                    "youtube": (310000, 72000, 6800, 140),
+                    "twitter": (120000, 8000, 450, 0),
+                    "twitch": (185000, 28000, 3200, 180),
+                    "kick": (95000, 14000, 1800, 110),
+                }
+            }
+        }
+
+        for creator_id, creator_data in creator_stats.items():
+            for platform, (base_followers, base_views, base_engagement, base_watch_hours) in creator_data["platforms"].items():
+                # Generate 30 days of data with realistic fluctuation and slight upward trend
+                for day_offset in range(30):
+                    date = (now - timedelta(days=29 - day_offset)).strftime('%Y-%m-%d')
+
+                    # Add small random variation and slight upward trend
+                    day_variation = (day_offset / 30.0) * 0.05  # 5% growth over 30 days
+                    day_noise = (hash(f"{creator_id}{platform}{day_offset}") % 10 - 5) / 100.0  # -5% to +5%
+
+                    followers = int(base_followers * (1 + day_variation + day_noise))
+                    views = int(base_views * (1 + day_variation + day_noise * 1.5))
+                    engagement = int(base_engagement * (1 + day_variation + day_noise * 1.5))
+                    new_followers = int((followers - int(base_followers * (1 + day_variation + day_noise * 0.9))) * 1.1) if day_offset > 0 else int(followers * 0.02)
+                    watch_hours = int(base_watch_hours * (1 + day_variation + day_noise)) if base_watch_hours > 0 else 0
+                    peak_viewers = int(base_watch_hours * 0.3) if base_watch_hours > 0 else 0
+
+                    stat_id = str(uuid.uuid4())
+                    c.execute('''INSERT INTO daily_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (stat_id, creator_id, platform, date, followers, views, engagement,
+                         new_followers, watch_hours, peak_viewers, now.isoformat()))
+
+        conn.commit()
 
     def _get_db(self):
         """Get database connection"""
@@ -908,13 +1063,64 @@ class RequestHandler(BaseHTTPRequestHandler):
     # ============ API Handlers - Creators ============
 
     def _handle_get_creators(self):
-        """GET /api/creators - List all creators"""
-        self._send_json(200, {'creators': list(CREATORS.values())})
+        """GET /api/creators - List all creators from database"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT * FROM creators ORDER BY name')
+        rows = c.fetchall()
+        conn.close()
+
+        creators = []
+        for row in rows:
+            creator = {
+                'id': row[0],
+                'name': row[1],
+                'niche': row[2],
+                'bio': row[3],
+                'platforms': json.loads(row[4]) if row[4] else {},
+                'services': json.loads(row[5]) if row[5] else [],
+                'pricing_tier': row[6],
+                'audience': row[7],
+                'contact_email': row[8],
+                'contact_phone': row[9],
+                'rate_card_url': row[10],
+                'verticals': json.loads(row[11]) if row[11] else [],
+                'brand_partnerships': json.loads(row[12]) if row[12] else [],
+                'recent_posts': json.loads(row[13]) if row[13] else []
+            }
+            creators.append(creator)
+
+        self._send_json(200, {'creators': creators})
 
     def _handle_get_creator(self, creator_id: str):
-        """GET /api/creators/:id - Get single creator"""
-        creator = CREATORS.get(creator_id)
-        if creator:
+        """GET /api/creators/:id - Get single creator from database"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('SELECT * FROM creators WHERE id = ?', (creator_id,))
+        row = c.fetchone()
+        conn.close()
+
+        if row:
+            creator = {
+                'id': row[0],
+                'name': row[1],
+                'niche': row[2],
+                'bio': row[3],
+                'platforms': json.loads(row[4]) if row[4] else {},
+                'services': json.loads(row[5]) if row[5] else [],
+                'pricing_tier': row[6],
+                'audience': row[7],
+                'contact_email': row[8],
+                'contact_phone': row[9],
+                'rate_card_url': row[10],
+                'verticals': json.loads(row[11]) if row[11] else [],
+                'brand_partnerships': json.loads(row[12]) if row[12] else [],
+                'recent_posts': json.loads(row[13]) if row[13] else []
+            }
             self._send_json(200, creator)
         else:
             self._send_json(404, {'error': 'Creator not found'})
@@ -1413,6 +1619,331 @@ class RequestHandler(BaseHTTPRequestHandler):
             json.dump(data, f, indent=2)
 
         self._send_json(200, {'saved': True})
+
+    # ============ API Handlers - Creator Management ============
+
+    def _handle_create_creator(self, data: Dict[str, Any]):
+        """POST /api/creators - Add a new creator"""
+        creator_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('''INSERT INTO creators VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (creator_id, data.get('name'), data.get('niche'), data.get('bio'),
+             json.dumps(data.get('platforms', {})), json.dumps(data.get('services', [])),
+             data.get('pricing_tier'), data.get('audience'), data.get('contact_email'),
+             data.get('contact_phone'), data.get('rate_card_url'),
+             json.dumps(data.get('verticals', [])), json.dumps(data.get('brand_partnerships', [])),
+             json.dumps(data.get('recent_posts', [])), now, now))
+
+        conn.commit()
+        conn.close()
+
+        self._log_activity('creator_added', f"Creator '{data.get('name')}' added", creator_id)
+
+        self._send_json(201, {'id': creator_id, 'created': True})
+
+    def _handle_update_creator(self, creator_id: str, data: Dict[str, Any]):
+        """PUT /api/creators/<id> - Update an existing creator"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        now = datetime.utcnow().isoformat()
+
+        # Build update query dynamically based on provided fields
+        update_fields = []
+        update_values = []
+
+        if 'name' in data:
+            update_fields.append('name = ?')
+            update_values.append(data['name'])
+        if 'niche' in data:
+            update_fields.append('niche = ?')
+            update_values.append(data['niche'])
+        if 'bio' in data:
+            update_fields.append('bio = ?')
+            update_values.append(data['bio'])
+        if 'platforms' in data:
+            update_fields.append('platforms = ?')
+            update_values.append(json.dumps(data['platforms']))
+        if 'services' in data:
+            update_fields.append('services = ?')
+            update_values.append(json.dumps(data['services']))
+        if 'pricing_tier' in data:
+            update_fields.append('pricing_tier = ?')
+            update_values.append(data['pricing_tier'])
+        if 'audience' in data:
+            update_fields.append('audience = ?')
+            update_values.append(data['audience'])
+        if 'contact_email' in data:
+            update_fields.append('contact_email = ?')
+            update_values.append(data['contact_email'])
+        if 'contact_phone' in data:
+            update_fields.append('contact_phone = ?')
+            update_values.append(data['contact_phone'])
+        if 'rate_card_url' in data:
+            update_fields.append('rate_card_url = ?')
+            update_values.append(data['rate_card_url'])
+        if 'verticals' in data:
+            update_fields.append('verticals = ?')
+            update_values.append(json.dumps(data['verticals']))
+        if 'brand_partnerships' in data:
+            update_fields.append('brand_partnerships = ?')
+            update_values.append(json.dumps(data['brand_partnerships']))
+        if 'recent_posts' in data:
+            update_fields.append('recent_posts = ?')
+            update_values.append(json.dumps(data['recent_posts']))
+
+        if update_fields:
+            update_fields.append('updated_at = ?')
+            update_values.append(now)
+            update_values.append(creator_id)
+
+            query = f"UPDATE creators SET {', '.join(update_fields)} WHERE id = ?"
+            c.execute(query, update_values)
+            conn.commit()
+
+        conn.close()
+
+        self._log_activity('creator_updated', f"Creator '{creator_id}' updated", creator_id)
+
+        self._send_json(200, {'id': creator_id, 'updated': True})
+
+    def _handle_delete_creator(self, creator_id: str):
+        """DELETE /api/creators/<id> - Delete a creator"""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('DELETE FROM creators WHERE id = ?', (creator_id,))
+        conn.commit()
+        conn.close()
+
+        self._log_activity('creator_deleted', f"Creator '{creator_id}' deleted", creator_id)
+
+        self._send_json(200, {'id': creator_id, 'deleted': True})
+
+    # ============ API Handlers - Scout Creators ============
+
+    def _handle_scout_search(self, params: Dict[str, str]):
+        """GET /api/scout/search - Search for potential creators"""
+        query = params.get('query', '')
+        platform = params.get('platform', '')
+        niche = params.get('niche', '')
+        min_followers = int(params.get('min_followers', 0))
+        max_followers = int(params.get('max_followers', 999999999))
+
+        # Generate realistic mock scout results
+        scout_results = self._generate_scout_results(query, platform, niche, min_followers, max_followers)
+
+        self._send_json(200, {'results': scout_results, 'count': len(scout_results)})
+
+    def _generate_scout_results(self, query: str, platform: str, niche: str, min_followers: int, max_followers: int) -> List[Dict[str, Any]]:
+        """Generate realistic mock scout results based on search parameters"""
+        creator_names = [
+            "Alex Chen", "Jordan Martinez", "Casey Williams", "Morgan Lee", "Taylor Brooks",
+            "Riley Davis", "Sam Anderson", "Parker Smith", "Casey Johnson", "Jamie Taylor",
+            "Morgan Garcia", "Alex Rodriguez", "Jordan Harris", "Taylor Thomas", "Sam Moore",
+            "Riley Jackson", "Casey White", "Jordan Harris", "Alex Martin", "Taylor Thompson"
+        ]
+
+        platforms_list = ["tiktok", "youtube", "instagram", "twitch", "kick", "x"]
+        niches_list = ["Comedy", "Fitness", "Wellness", "Gaming", "Beauty", "Tech", "Lifestyle", "Education"]
+
+        results = []
+        hash_seed = hash(f"{query}{platform}{niche}")
+
+        for i in range(15):
+            idx = (hash_seed + i) % len(creator_names)
+            handle = f"@{creator_names[idx].lower().replace(' ', '_')}{i}"
+
+            selected_platform = platform if platform else platforms_list[(hash_seed + i) % len(platforms_list)]
+            selected_niche = niche if niche else niches_list[(hash_seed + i) % len(niches_list)]
+
+            # Generate followers within the requested range
+            base_followers = min_followers + ((hash_seed + i) % (max_followers - min_followers))
+            followers = max(min_followers, min(base_followers, max_followers))
+
+            engagement_rate = 5.0 + ((hash_seed + i) % 80) / 10.0
+            recent_growth = ((hash_seed + i) % 25) - 5
+
+            match_score = 50 + ((hash_seed + i) % 50)
+            if query.lower() in selected_niche.lower():
+                match_score = min(100, match_score + 15)
+
+            results.append({
+                'name': creator_names[idx],
+                'handle': handle,
+                'platform': selected_platform,
+                'followers': followers,
+                'engagement_rate': round(engagement_rate, 1),
+                'niche': selected_niche,
+                'avatar_placeholder': f'https://api.dicebear.com/7.x/avataaars/svg?seed={handle}',
+                'bio': f"{selected_niche} content creator with {followers:,} followers",
+                'recent_growth': recent_growth,
+                'match_score': match_score
+            })
+
+        return sorted(results, key=lambda x: x['match_score'], reverse=True)
+
+    def _handle_shortlist_creator(self, data: Dict[str, Any]):
+        """POST /api/scout/shortlist - Save a scouted creator to shortlist"""
+        self._init_db()
+        shortlist_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('''INSERT INTO shortlist VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (shortlist_id, data.get('name'), data.get('handle'), data.get('platform'),
+             data.get('followers'), data.get('engagement_rate'), data.get('niche'),
+             data.get('avatar_placeholder'), data.get('bio'), data.get('recent_growth'),
+             data.get('match_score'), now))
+
+        conn.commit()
+        conn.close()
+
+        self._send_json(201, {'id': shortlist_id, 'shortlisted': True})
+
+    # ============ API Handlers - Daily Stats ============
+
+    def _handle_get_daily_stats(self, params: Dict[str, str]):
+        """GET /api/stats/daily - Get daily platform stats"""
+        creator_id = params.get('creator_id')
+        platform = params.get('platform')
+        date_from = params.get('date_from')
+        date_to = params.get('date_to')
+
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        query = 'SELECT * FROM daily_stats WHERE 1=1'
+        query_params = []
+
+        if creator_id:
+            query += ' AND creator_id = ?'
+            query_params.append(creator_id)
+        if platform:
+            query += ' AND platform = ?'
+            query_params.append(platform)
+        if date_from:
+            query += ' AND date >= ?'
+            query_params.append(date_from)
+        if date_to:
+            query += ' AND date <= ?'
+            query_params.append(date_to)
+
+        query += ' ORDER BY date DESC'
+        c.execute(query, query_params)
+        rows = c.fetchall()
+        conn.close()
+
+        stats = []
+        for row in rows:
+            stats.append({
+                'id': row[0],
+                'creator_id': row[1],
+                'platform': row[2],
+                'date': row[3],
+                'followers': row[4],
+                'views': row[5],
+                'engagement': row[6],
+                'new_followers': row[7],
+                'watch_hours': row[8],
+                'peak_viewers': row[9]
+            })
+
+        self._send_json(200, {'stats': stats, 'count': len(stats)})
+
+    def _handle_record_daily_stats(self, data: Dict[str, Any]):
+        """POST /api/stats/daily - Record daily stats"""
+        self._init_db()
+        stat_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        conn = self._get_db()
+        c = conn.cursor()
+
+        c.execute('''INSERT INTO daily_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (stat_id, data.get('creator_id'), data.get('platform'), data.get('date'),
+             data.get('followers'), data.get('views'), data.get('engagement'),
+             data.get('new_followers'), data.get('watch_hours'), data.get('peak_viewers'), now))
+
+        conn.commit()
+        conn.close()
+
+        self._send_json(201, {'id': stat_id, 'recorded': True})
+
+    def _handle_get_stats_summary(self, params: Dict[str, str]):
+        """GET /api/stats/summary - Get aggregated stats summary"""
+        creator_id = params.get('creator_id')
+
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        # Get the latest stats across all platforms for the creator
+        if creator_id:
+            c.execute('''
+                SELECT platform, followers, views, engagement, new_followers, date
+                FROM daily_stats
+                WHERE creator_id = ?
+                ORDER BY date DESC
+                LIMIT 6
+            ''', (creator_id,))
+        else:
+            c.execute('''
+                SELECT platform, followers, views, engagement, new_followers, date
+                FROM daily_stats
+                ORDER BY date DESC
+                LIMIT 18
+            ''')
+
+        rows = c.fetchall()
+
+        # Calculate aggregates
+        total_followers = 0
+        platform_stats = {}
+        best_platform = None
+        best_engagement = 0
+        dates = []
+
+        for row in rows:
+            platform, followers, views, engagement, new_followers, date = row
+            if platform not in platform_stats:
+                platform_stats[platform] = {'followers': followers, 'engagement': engagement}
+            total_followers += followers if followers else 0
+            if engagement and engagement > best_engagement:
+                best_engagement = engagement
+                best_platform = platform
+            if date not in dates:
+                dates.append(date)
+
+        # Calculate daily growth rate (7-day trend)
+        daily_growth_rate = 0.0
+        if len(dates) >= 2:
+            first_date = dates[-1]
+            last_date = dates[0]
+            days_diff = max(1, len(dates) - 1)
+            daily_growth_rate = ((len(dates) - 1) / days_diff) if days_diff > 0 else 0
+
+        summary = {
+            'total_followers': total_followers,
+            'daily_growth_rate': round(daily_growth_rate, 2),
+            'best_performing_platform': best_platform,
+            'platform_stats': platform_stats,
+            'trend_period_days': len(dates)
+        }
+
+        conn.close()
+
+        self._send_json(200, summary)
 
     # ============ Helper Methods ============
 
