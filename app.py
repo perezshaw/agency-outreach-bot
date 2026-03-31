@@ -34,7 +34,7 @@ SMTP_FROM = os.environ.get('SMTP_FROM', '')
 DB_PATH = os.environ.get('DB_PATH', '/tmp/agency_outreach.db')
 SETTINGS_PATH = os.environ.get('SETTINGS_PATH', '/tmp/agency_settings.json')
 BASE_DIR = Path(__file__).parent
-APP_PASSWORD = os.environ.get('APP_PASSWORD', 'RezTheGiant2024')
+APP_PASSWORD = os.environ.get('APP_PASSWORD', '')  # Empty = no auth required
 
 # Session store (in-memory)
 VALID_SESSIONS = set()
@@ -579,7 +579,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     # ============ Authentication Methods ============
 
     def _check_session(self) -> bool:
-        """Check if request has valid session cookie"""
+        """Check if request has valid session cookie. If no password set, always allow."""
+        if not APP_PASSWORD:
+            return True
         cookie_header = self.headers.get('Cookie', '')
         if 'session_id=' in cookie_header:
             session_id = cookie_header.split('session_id=')[1].split(';')[0].strip()
