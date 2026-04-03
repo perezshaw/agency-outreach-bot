@@ -14,6 +14,8 @@ import io
 import threading
 import time
 import secrets
+import zipfile
+import xml.etree.ElementTree as ET
 import urllib.request
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -1205,6 +1207,189 @@ _twitch_ingestion_status = {
 _twitch_ingestion_lock = threading.Lock()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Minimal XLSX Writer (Python stdlib only — uses zipfile + XML)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class XlsxWriter:
+    """Generate valid .xlsx files using only Python stdlib (zipfile + XML).
+
+    Usage:
+        wb = XlsxWriter()
+        wb.add_sheet('Brands', headers=['Name','Vertical'], rows=[['Nike','Fitness'], ...])
+        wb.add_sheet('Emails', headers=['Date','To'], rows=[...])
+        xlsx_bytes = wb.build()   # Returns bytes you can write to a file or HTTP response
+    """
+
+    def __init__(self):
+        self.sheets: List[Dict] = []
+        self.shared_strings: List[str] = []
+        self.ss_index: Dict[str, int] = {}
+
+    def _share(self, text: str) -> int:
+        """Intern a string in the shared-strings table; return its index."""
+        text = str(text) if text is not None else ''
+        if text not in self.ss_index:
+            self.ss_index[text] = len(self.shared_strings)
+            self.shared_strings.append(text)
+        return self.ss_index[text]
+
+    def add_sheet(self, name: str, headers: List[str], rows: List[List]) -> None:
+        self.sheets.append({'name': name, 'headers': headers, 'rows': rows})
+
+    @staticmethod
+    def _col_letter(idx: int) -> str:
+        """0 -> A, 1 -> B, ... 25 -> Z, 26 -> AA ..."""
+        result = ''
+        while True:
+            result = chr(65 + idx % 26) + result
+            idx = idx // 26 - 1
+            if idx < 0:
+                break
+        return result
+
+    def _build_sheet_xml(self, sheet: Dict) -> str:
+        rows_xml = []
+        # Header row (bold via style index 1)
+        cells = []
+        for ci, h in enumerate(sheet['headers']):
+            ref = f'{self._col_letter(ci)}1'
+            si = self._share(h)
+            cells.append(f'<c r="{ref}" t="s" s="1"><v>{si}</v></c>')
+        rows_xml.append(f'<row r="1">{"".join(cells)}</row>')
+        # Data rows
+        for ri, row in enumerate(sheet['rows'], start=2):
+            cells = []
+            for ci, val in enumerate(row):
+                ref = f'{self._col_letter(ci)}{ri}'
+                if val is None or val == '':
+                    cells.append(f'<c r="{ref}" t="s"><v>{self._share("")}</v></c>')
+                elif isinstance(val, (int, float)):
+                    cells.append(f'<c r="{ref}"><v>{val}</v></c>')
+                else:
+                    si = self._share(str(val))
+                    cells.append(f'<c r="{ref}" t="s"><v>{si}</v></c>')
+            rows_xml.append(f'<row r="{ri}">{"".join(cells)}</row>')
+        last_col = self._col_letter(max(len(sheet['headers']) - 1, 0))
+        last_row = len(sheet['rows']) + 1
+        dim = f'A1:{last_col}{last_row}'
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<dimension ref="{dim}"/>'
+            '<sheetViews><sheetView tabSelected="1" workbookViewId="0">'
+            '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews>'
+            '<cols>'
+            + ''.join(f'<col min="{i+1}" max="{i+1}" width="18" bestFit="1" customWidth="1"/>'
+                      for i in range(len(sheet['headers'])))
+            + '</cols>'
+            f'<sheetData>{"".join(rows_xml)}</sheetData>'
+            '<autoFilter ref="' + dim + '"/>'
+            '</worksheet>'
+        )
+
+    def _build_shared_strings_xml(self) -> str:
+        items = ''.join(
+            f'<si><t xml:space="preserve">{self._esc(s)}</t></si>'
+            for s in self.shared_strings
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            f'count="{len(self.shared_strings)}" uniqueCount="{len(self.shared_strings)}">'
+            f'{items}</sst>'
+        )
+
+    @staticmethod
+    def _esc(text: str) -> str:
+        return (text.replace('&', '&amp;').replace('<', '&lt;')
+                .replace('>', '&gt;').replace('"', '&quot;'))
+
+    def build(self) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # [Content_Types].xml
+            sheet_overrides = ''.join(
+                f'<Override PartName="/xl/worksheets/sheet{i+1}.xml" '
+                f'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                for i in range(len(self.sheets))
+            )
+            zf.writestr('[Content_Types].xml',
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+                f'{sheet_overrides}'
+                '</Types>')
+
+            # _rels/.rels
+            zf.writestr('_rels/.rels',
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                '</Relationships>')
+
+            # xl/_rels/workbook.xml.rels
+            rels = []
+            for i in range(len(self.sheets)):
+                rels.append(f'<Relationship Id="rId{i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i+1}.xml"/>')
+            rels.append(f'<Relationship Id="rId{len(self.sheets)+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>')
+            rels.append(f'<Relationship Id="rId{len(self.sheets)+2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>')
+            zf.writestr('xl/_rels/workbook.xml.rels',
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + ''.join(rels) + '</Relationships>')
+
+            # xl/workbook.xml
+            wb_sheets = ''.join(
+                f'<sheet name="{self._esc(s["name"])}" sheetId="{i+1}" r:id="rId{i+1}"/>'
+                for i, s in enumerate(self.sheets)
+            )
+            zf.writestr('xl/workbook.xml',
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                f'<sheets>{wb_sheets}</sheets></workbook>')
+
+            # xl/styles.xml (two styles: default + bold header)
+            zf.writestr('xl/styles.xml',
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<fonts count="2">'
+                '<font><sz val="11"/><name val="Arial"/></font>'
+                '<font><b/><sz val="11"/><name val="Arial"/><color rgb="FFFFFFFF"/></font>'
+                '</fonts>'
+                '<fills count="3">'
+                '<fill><patternFill patternType="none"/></fill>'
+                '<fill><patternFill patternType="gray125"/></fill>'
+                '<fill><patternFill patternType="solid"><fgColor rgb="FF1a1a2e"/></patternFill></fill>'
+                '</fills>'
+                '<borders count="1"><border/></borders>'
+                '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                '<cellXfs count="2">'
+                '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+                '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+                '</cellXfs>'
+                '</styleSheet>')
+
+            # Build sheet XMLs (must happen before sharedStrings)
+            sheet_xmls = []
+            for sheet in self.sheets:
+                sheet_xmls.append(self._build_sheet_xml(sheet))
+
+            for i, xml in enumerate(sheet_xmls):
+                zf.writestr(f'xl/worksheets/sheet{i+1}.xml', xml)
+
+            # xl/sharedStrings.xml
+            zf.writestr('xl/sharedStrings.xml', self._build_shared_strings_xml())
+
+        return buf.getvalue()
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler for Agency Outreach Bot API"""
 
@@ -1302,6 +1487,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path.startswith('/api/twitch/creator/'):
                 twitch_id = path.split('/')[-1]
                 self._handle_twitch_creator(twitch_id)
+            elif path == '/api/export/excel':
+                self._handle_export_excel()
+            elif path == '/api/outreach/history':
+                self._handle_outreach_history(params)
             else:
                 self._send_json(404, {'error': 'Not found'})
         except Exception as e:
@@ -1340,6 +1529,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_compose_message(data)
             elif path == '/api/outreach/send-email':
                 self._handle_send_email(data)
+            elif path == '/api/outreach/bulk-send':
+                self._handle_bulk_send(data)
             elif path == '/api/outreach/log':
                 self._handle_log_outreach(data)
             elif path == '/api/settings':
@@ -1773,17 +1964,36 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         conn.commit()
 
-        # Seed brands if table is empty
+        # Seed brands from JSON seed file (1006 brands) or fallback to SEED_BRANDS
         c.execute('SELECT COUNT(*) FROM brands')
         if c.fetchone()[0] == 0:
-            for brand in SEED_BRANDS:
-                brand_id = str(uuid.uuid4())
-                now = datetime.utcnow().isoformat()
-                c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                    (brand_id, brand['name'], brand['vertical'], brand['contact_name'],
-                     brand['contact_email'], brand['contact_title'], brand['website'],
-                     brand['instagram'], brand['linkedin'], brand['tiktok'],
-                     brand['budget_tier'], 'New', None, now, now))
+            seed_path = BASE_DIR / 'brands_seed.json'
+            if seed_path.exists():
+                try:
+                    with open(seed_path, 'r') as f:
+                        seed_brands = json.load(f)
+                    for brand in seed_brands:
+                        brand_id = str(uuid.uuid4())
+                        now = datetime.utcnow().isoformat()
+                        c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (brand_id, brand.get('name', ''), brand.get('vertical', ''),
+                             brand.get('contact_name', ''), brand.get('contact_email', brand.get('email_pattern', '')),
+                             brand.get('contact_title', ''), brand.get('website', ''),
+                             brand.get('instagram', ''), brand.get('linkedin', ''), '',
+                             brand.get('budget_tier', ''), 'New',
+                             brand.get('notes', ''), now, now))
+                except Exception as e:
+                    print(f"Warning: could not load brands_seed.json: {e}")
+            else:
+                # Fallback to hardcoded SEED_BRANDS
+                for brand in SEED_BRANDS:
+                    brand_id = str(uuid.uuid4())
+                    now = datetime.utcnow().isoformat()
+                    c.execute('''INSERT INTO brands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (brand_id, brand['name'], brand['vertical'], brand['contact_name'],
+                         brand['contact_email'], brand['contact_title'], brand['website'],
+                         brand['instagram'], brand['linkedin'], brand['tiktok'],
+                         brand['budget_tier'], 'New', None, now, now))
             conn.commit()
 
         # Seed creators if table is empty
@@ -3085,6 +3295,188 @@ class RequestHandler(BaseHTTPRequestHandler):
         cols = [desc[0] for desc in c.description]
         creator = dict(zip(cols, row))
         self._send_json(200, creator)
+
+    # ============ Excel Export & Bulk Send ============
+
+    def _handle_export_excel(self):
+        """GET /api/export/excel — Generate master XLSX with Brands + Email Log tabs."""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        # Tab 1: All Brands
+        c.execute('SELECT name, vertical, contact_name, contact_email, contact_title, '
+                  'website, instagram, linkedin, budget_tier, outreach_status, notes '
+                  'FROM brands ORDER BY name')
+        brand_rows = c.fetchall()
+        brand_headers = ['Brand Name', 'Vertical', 'Contact Name', 'Contact Email',
+                         'Contact Title', 'Website', 'Instagram', 'LinkedIn',
+                         'Budget Tier', 'Outreach Status', 'Notes']
+
+        # Tab 2: Email/Outreach Log
+        c.execute('''
+            SELECT o.sent_at, o.channel, o.recipient, o.subject, o.status,
+                   o.replied_at, o.notes, b.name as brand_name
+            FROM outreach_log o
+            LEFT JOIN brands b ON o.brand_id = b.id
+            ORDER BY o.sent_at DESC
+        ''')
+        log_rows = c.fetchall()
+        log_headers = ['Date Sent', 'Channel', 'Recipient', 'Subject', 'Status',
+                       'Reply Date', 'Notes', 'Brand Name']
+
+        conn.close()
+
+        # Build Excel
+        wb = XlsxWriter()
+        wb.add_sheet('Brands', brand_headers, [list(r) for r in brand_rows])
+        wb.add_sheet('Email Log', log_headers, [list(r) for r in log_rows])
+        xlsx_bytes = wb.build()
+
+        # Send as download
+        filename = f'Agency_Master_Data_{datetime.utcnow().strftime("%Y%m%d")}.xlsx'
+        self.send_response(200)
+        self._set_cors_headers()
+        self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+        self.send_header('Content-Length', str(len(xlsx_bytes)))
+        self.end_headers()
+        self.wfile.write(xlsx_bytes)
+
+    def _handle_outreach_history(self, params: Dict[str, str]):
+        """GET /api/outreach/history — Get all outreach with brand names."""
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        brand_id = params.get('brand_id', '')
+        query = '''
+            SELECT o.id, o.campaign_id, o.brand_id, o.creator_id, o.channel,
+                   o.recipient, o.subject, o.body, o.status, o.sent_at,
+                   o.replied_at, o.notes, b.name as brand_name
+            FROM outreach_log o
+            LEFT JOIN brands b ON o.brand_id = b.id
+        '''
+        query_params = []
+        if brand_id:
+            query += ' WHERE o.brand_id = ?'
+            query_params.append(brand_id)
+        query += ' ORDER BY o.sent_at DESC LIMIT 500'
+
+        c.execute(query, query_params)
+        rows = c.fetchall()
+        cols = [desc[0] for desc in c.description]
+        conn.close()
+
+        history = [dict(zip(cols, row)) for row in rows]
+        self._send_json(200, {'history': history, 'count': len(history)})
+
+    def _handle_bulk_send(self, data: Dict[str, Any]):
+        """POST /api/outreach/bulk-send — Send personalized emails to multiple brands.
+
+        Expected body:
+        {
+            "brand_ids": ["id1", "id2", ...],
+            "creator_id": "1",
+            "template_body": "Hi {{contact_name}}, ...",
+            "subject": "Partnership Opportunity — {{creator_name}} x {{brand_name}}"
+        }
+        """
+        brand_ids = data.get('brand_ids', [])
+        creator_id = data.get('creator_id', '1')
+        template_body = data.get('template_body', '')
+        subject_template = data.get('subject', '')
+
+        if not brand_ids:
+            self._send_json(400, {'error': 'No brands selected'})
+            return
+        if not template_body:
+            self._send_json(400, {'error': 'No email template provided'})
+            return
+
+        creator = CREATORS.get(creator_id, {})
+        self._init_db()
+        conn = self._get_db()
+        c = conn.cursor()
+
+        results = {'sent': [], 'failed': [], 'skipped': []}
+
+        for brand_id in brand_ids:
+            c.execute('SELECT * FROM brands WHERE id = ?', (brand_id,))
+            row = c.fetchone()
+            if not row:
+                results['skipped'].append({'brand_id': brand_id, 'reason': 'Not found'})
+                continue
+
+            cols = [desc[0] for desc in c.description]
+            brand = dict(zip(cols, row))
+
+            # Skip if no contact email
+            contact_email = brand.get('contact_email', '')
+            if not contact_email or '@' not in contact_email:
+                results['skipped'].append({
+                    'brand_id': brand_id,
+                    'brand_name': brand.get('name', ''),
+                    'reason': 'No valid contact email'
+                })
+                continue
+
+            # Fill template variables
+            replacements = {
+                '{{contact_name}}': brand.get('contact_name') or brand.get('contact_title', 'Team'),
+                '{{brand_name}}': brand.get('name', ''),
+                '{{creator_name}}': creator.get('name', ''),
+                '{{niche}}': creator.get('niche', ''),
+                '{{total_reach}}': str(creator.get('total_reach', 0)),
+                '{{avg_engagement_rate}}': str(creator.get('avg_engagement_rate', 0)),
+                '{{audience}}': creator.get('audience', ''),
+                '{{vertical}}': brand.get('vertical', ''),
+            }
+
+            body = template_body
+            subject = subject_template
+            for key, val in replacements.items():
+                body = body.replace(key, val)
+                subject = subject.replace(key, val)
+
+            try:
+                send_email(contact_email, subject, body)
+
+                # Log it
+                log_id = str(uuid.uuid4())
+                now = datetime.utcnow().isoformat()
+                c.execute('INSERT INTO outreach_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (log_id, None, brand_id, creator_id, 'email', contact_email,
+                     subject, body, 'sent', now, None, None))
+                c.execute('UPDATE brands SET outreach_status = ? WHERE id = ?', ('Outreached', brand_id))
+
+                results['sent'].append({
+                    'brand_id': brand_id,
+                    'brand_name': brand.get('name', ''),
+                    'to': contact_email
+                })
+            except Exception as e:
+                results['failed'].append({
+                    'brand_id': brand_id,
+                    'brand_name': brand.get('name', ''),
+                    'error': str(e)
+                })
+
+        conn.commit()
+        conn.close()
+
+        # Log activity
+        sent_count = len(results['sent'])
+        self._log_activity('bulk_send',
+            f"Bulk email sent to {sent_count} brands for {creator.get('name', 'unknown')}")
+
+        self._send_json(200, {
+            'total': len(brand_ids),
+            'sent': len(results['sent']),
+            'failed': len(results['failed']),
+            'skipped': len(results['skipped']),
+            'details': results,
+        })
 
     # ============ Helper Methods ============
 
