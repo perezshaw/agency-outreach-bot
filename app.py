@@ -1238,7 +1238,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             # Check authentication for all other routes
             if not self._check_session():
-                self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+                # Redirect browsers to login page, return JSON for API calls
+                if path.startswith('/api/'):
+                    self._send_json(401, {'error': 'Unauthorized. Please log in.'})
+                else:
+                    self.send_response(302)
+                    self.send_header('Location', '/login')
+                    self.end_headers()
                 return
 
             # Protected routes
@@ -1411,118 +1417,91 @@ class RequestHandler(BaseHTTPRequestHandler):
         return False
 
     def _serve_login_page(self):
-        """Serve the login page with dark theme"""
+        """Serve the login page with RezTheGiant branding"""
         html = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Agency Outreach Bot - Login</title>
+    <title>RezTheGiant — Outreach Portal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #0f0f1e 0%, #1a1a2e 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0a0f;
             display: flex;
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            color: #fff;
+            color: #f0f0f5;
         }
-        .container {
-            width: 100%;
-            max-width: 400px;
-            padding: 20px;
+        .bg-grid {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+            background-size: 60px 60px; pointer-events: none;
         }
+        .glow-1 { position: fixed; top: -200px; right: -100px; width: 500px; height: 500px; border-radius: 50%; background: #00d4ff; filter: blur(150px); opacity: 0.12; pointer-events: none; }
+        .glow-2 { position: fixed; bottom: -200px; left: -100px; width: 500px; height: 500px; border-radius: 50%; background: #a855f7; filter: blur(150px); opacity: 0.12; pointer-events: none; }
+        .container { width: 100%; max-width: 420px; padding: 20px; position: relative; z-index: 1; }
         .card {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 12px;
-            padding: 40px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-        }
-        h1 {
-            margin-bottom: 10px;
-            font-size: 28px;
+            background: #1a1a2e;
+            border: 1px solid #2a2a3e;
+            border-radius: 20px;
+            padding: 3rem;
             text-align: center;
         }
-        .subtitle {
-            text-align: center;
-            color: rgba(255, 255, 255, 0.6);
-            margin-bottom: 30px;
-            font-size: 14px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 14px;
-            font-weight: 500;
-            color: rgba(255, 255, 255, 0.9);
-        }
+        .lock { font-size: 2.5rem; margin-bottom: 1.25rem; display: block; }
+        .brand { font-family: 'JetBrains Mono', monospace; font-size: 1.1rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .brand em { color: #00d4ff; font-style: normal; }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; background: rgba(0,255,136,0.1); border: 1px solid rgba(0,255,136,0.2); border-radius: 4px; font-size: 0.65rem; font-family: 'JetBrains Mono', monospace; font-weight: 600; color: #00ff88; text-transform: uppercase; letter-spacing: 1px; vertical-align: super; margin-left: 4px; }
+        .subtitle { color: #8888a0; margin-bottom: 2rem; font-size: 0.85rem; line-height: 1.5; }
+        .form-group { margin-bottom: 1.25rem; text-align: left; }
+        label { display: block; margin-bottom: 0.5rem; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; font-weight: 500; color: #8888a0; text-transform: uppercase; letter-spacing: 1.5px; }
         input[type="password"] {
-            width: 100%;
-            padding: 12px 15px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.08);
-            color: #fff;
-            font-size: 14px;
-            transition: all 0.3s ease;
+            width: 100%; padding: 0.85rem 1rem;
+            background: rgba(255,255,255,0.04); border: 1px solid #2a2a3e; border-radius: 10px;
+            color: #f0f0f5; font-family: 'Inter', sans-serif; font-size: 1rem;
+            outline: none; transition: all 0.3s;
         }
-        input[type="password"]:focus {
-            outline: none;
-            background: rgba(255, 255, 255, 0.12);
-            border-color: rgba(255, 255, 255, 0.25);
-            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05);
-        }
+        input[type="password"]:focus { border-color: #00d4ff; box-shadow: 0 0 20px rgba(0,212,255,0.15); }
+        input[type="password"].shake { border-color: #ff4444; box-shadow: 0 0 20px rgba(255,68,68,0.15); animation: shake 0.4s ease; }
+        @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-8px)} 50%{transform:translateX(8px)} 75%{transform:translateX(-4px)} }
         button {
-            width: 100%;
-            padding: 12px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #fff;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 10px;
+            width: 100%; padding: 0.85rem;
+            background: linear-gradient(135deg, #00d4ff, #0088cc);
+            color: #000; font-family: 'Inter', sans-serif; font-size: 0.95rem; font-weight: 700;
+            border: none; border-radius: 10px; cursor: pointer;
+            transition: all 0.3s; box-shadow: 0 0 20px rgba(0,212,255,0.3);
         }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(102, 126, 234, 0.4);
-        }
-        button:active {
-            transform: translateY(0);
-        }
-        .error {
-            color: #ff6b6b;
-            font-size: 13px;
-            margin-top: 10px;
-            display: none;
-        }
-        .error.show {
-            display: block;
-        }
+        button:hover { transform: translateY(-2px); box-shadow: 0 0 40px rgba(0,212,255,0.4); }
+        button:active { transform: translateY(0); }
+        .error { color: #ff4444; font-size: 0.8rem; margin-top: 1rem; min-height: 1.2rem; font-weight: 500; display: none; }
+        .error.show { display: block; }
+        .footer { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid #2a2a3e; font-size: 0.75rem; color: #8888a0; }
+        .footer a { color: #00d4ff; text-decoration: none; }
     </style>
 </head>
 <body>
+    <div class="bg-grid"></div>
+    <div class="glow-1"></div>
+    <div class="glow-2"></div>
     <div class="container">
         <div class="card">
-            <h1>Agency Bot</h1>
-            <p class="subtitle">Enter password to continue</p>
+            <span class="lock">&#x1F512;</span>
+            <div class="brand"><em>Rez</em>TheGiant <span class="badge">Outreach</span></div>
+            <p class="subtitle">This portal is restricted. Enter the access code to continue.</p>
             <form id="loginForm">
                 <div class="form-group">
-                    <label for="password">Password</label>
-                    <input type="password" id="password" name="password" placeholder="Enter password" required autofocus>
+                    <label for="password">Access Code</label>
+                    <input type="password" id="password" name="password" placeholder="Enter password..." required autofocus>
                 </div>
-                <button type="submit">Login</button>
+                <button type="submit">Authenticate</button>
                 <div class="error" id="error"></div>
             </form>
+            <div class="footer"><a href="https://rezthegiant.com">rezthegiant.com</a> &mdash; RezTheGiant LLC</div>
         </div>
     </div>
     <script>
